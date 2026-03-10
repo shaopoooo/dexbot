@@ -87,15 +87,12 @@ const logger = winston.createLogger({
 });
 
 /**
- * Dedicated logger for position snapshots (append-only history)
+ * Dedicated logger for position snapshots (append-only history).
+ * Outputs raw pre-formatted text — no timestamp prefix added here.
  */
 export const positionLogger = winston.createLogger({
     level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-        winston.format.json()
-    ),
-    defaultMeta: { service: 'PositionSnapshot' },
+    format: winston.format.printf(({ message }) => String(message)),
     transports: [
         new winston.transports.File({
             filename: path.join(logDir, 'positions.log'),

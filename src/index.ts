@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { PoolScanner, PoolStats } from './services/PoolScanner';
 import { BBEngine, BBResult, getPriceBufferSnapshot, restorePriceBuffer } from './services/BBEngine';
 import { RiskManager, PositionState, RiskAnalysis } from './services/RiskManager';
+import { PnlCalculator } from './services/PnlCalculator';
 import { TelegramBotService } from './bot/TelegramBot';
 import { PositionScanner, PositionRecord, getOpenTimestampSnapshot, restoreOpenTimestamps } from './services/PositionScanner';
 import { createServiceLogger } from './utils/logger';
@@ -114,7 +115,7 @@ async function runRiskManager() {
       previousBandwidths[poolKey] = currentBandwidth;
 
       const positionState: PositionState = {
-        capital: pos.positionValueUSD || 1000,
+        capital: PnlCalculator.getInitialCapital(pos.tokenId) ?? pos.positionValueUSD,
         tickLower: pos.tickLower,
         tickUpper: pos.tickUpper,
         unclaimedFees: pos.unclaimedFeesUSD,

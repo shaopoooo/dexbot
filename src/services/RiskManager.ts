@@ -1,4 +1,5 @@
 import { BBResult } from './BBEngine';
+import { config } from '../config';
 
 export interface PositionState {
     capital: number;           // $20,000 max initially
@@ -21,8 +22,7 @@ export interface RiskAnalysis {
 }
 
 export class RiskManager {
-    // Gas cost estimation for compounding (e.g. $G)
-    private static readonly COMPOUND_GAS_COST_USD = 1.5;
+    private static readonly COMPOUND_GAS_COST_USD = config.DEFAULT_GAS_COST_USD;
 
     // Warning Thresholds
     public static readonly RED_ALERT_BREAKEVEN_DAYS = 30;

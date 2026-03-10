@@ -48,7 +48,6 @@
 | `RPC_URL` | 否 | Base 主網 RPC 端點（預設：`https://mainnet.base.org`） |
 | `WALLET_ADDRESS_1` | 否 | 第一個監測錢包地址 |
 | `WALLET_ADDRESS_2` | 否 | 第二個監測錢包地址（可繼續增加 `_3`, `_4`...） |
-| `SUBGRAPH_API_KEY` | 是 | [The Graph](https://thegraph.com/) API 金鑰（用於 Uniswap / PancakeSwap 子圖查詢） |
 | `BOT_TOKEN` | 是 | Telegram Bot Token（從 [@BotFather](https://t.me/BotFather) 取得） |
 | `CHAT_ID` | 是 | Telegram 接收推播的 Chat ID |
 | `INITIAL_INVESTMENT_<tokenId>` | 否 | 各倉位初始本金 USD，用於 IL / 淨 APR 計算（如 `INITIAL_INVESTMENT_123456=1000`） |
@@ -62,7 +61,6 @@
 RPC_URL=https://your-quicknode-endpoint.quiknode.pro/your-key/
 WALLET_ADDRESS_1=0xYourFirstWalletAddress
 WALLET_ADDRESS_2=0xYourSecondWalletAddress
-SUBGRAPH_API_KEY=your_graph_api_key
 BOT_TOKEN=123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ
 CHAT_ID=-100123456789
 
@@ -85,7 +83,6 @@ npm install -g @dotenvx/dotenvx
 # 設定單一變數（自動寫入 .env）
 npx dotenvx set BOT_TOKEN 123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ
 npx dotenvx set CHAT_ID -100123456789
-npx dotenvx set SUBGRAPH_API_KEY your_graph_api_key
 
 # 設定多個錢包
 npx dotenvx set WALLET_ADDRESS_1 0xYourFirstWalletAddress
@@ -131,16 +128,16 @@ src/
 ├── dryrun.ts                   # 乾跑測試用（不啟動 Telegram）
 ├── config/
 │   ├── env.ts                  # 環境變數讀取（process.env）
-│   ├── constants.ts            # 常數（池地址、子圖端點、快取 TTL）
+│   ├── constants.ts            # 常數（池地址、快取 TTL、BB 參數、EWMA、區塊掃描、Gas）
 │   ├── abis.ts                 # 合約 ABI（NPM、Pool）
 │   └── index.ts                # 統一匯出入口
 ├── services/
-│   ├── PoolScanner.ts          # APR 掃描（DexScreener + The Graph + GeckoTerminal）
-│   ├── BBEngine.ts             # 動態布林通道（20 SMA + 30D 波動率）
+│   ├── PoolScanner.ts          # APR 掃描（DexScreener + GeckoTerminal）
+│   ├── BBEngine.ts             # 動態布林通道（20 SMA + EWMA stdDev + 30D 波動率）
+│   ├── ChainEventScanner.ts    # 通用鏈上事件掃描器（ScanHandler 介面 + OpenTimestampHandler）
 │   ├── PositionScanner.ts      # LP NFT 倉位監測（On-chain RPC）
 │   ├── RiskManager.ts          # 風險評估（Health Score、IL Breakeven、EOQ 複利訊號）
 │   ├── PnlCalculator.ts        # 絕對 PNL、開倉資訊、組合總覽計算
-│   ├── OpenTimestampService.ts # 批次查詢 NFT 建倉時間戳（per NPM 單次 getLogs）
 │   └── rebalance.ts            # 再平衡建議（純計算，不執行交易）
 ├── bot/
 │   └── TelegramBot.ts          # Telegram 推播格式化
@@ -164,7 +161,7 @@ data/
 
 - `combined.log`：全量日誌（最大 5MB × 5 份）
 - `error.log`：僅錯誤（最大 5MB × 3 份）
-- `positions.log`：倉位快照 JSON 歷史（最大 10MB × 10 份）
+- `positions.log`：倉位快照文字格式歷史（最大 10MB × 10 份）
 
 ---
 
@@ -186,9 +183,9 @@ data/
 PoolScanner → BBEngine → PositionScanner → RiskManager → TelegramBot
 ```
 
-1. **PoolScanner**：從 DexScreener 取得 TVL；The Graph（Uniswap/PancakeSwap）或 GeckoTerminal（Aerodrome）取得成交量；計算各池 APR
-2. **BBEngine**：先行計算所有池的布林通道（避免 PositionScanner 重複呼叫 GeckoTerminal），維護 in-memory 小時價格緩衝區，計算 20 SMA + 動態 k 值，產出建議 Tick 區間
-3. **PositionScanner**：掃描多個錢包的 LP NFT（含 `TRACKED_TOKEN_<tokenId>` 鎖倉倉位），注意 Aerodrome NPM `positions()` 回傳 `tickSpacing` 而非 `fee`；使用預計算 BB；以 sqrtPrice 數學計算倉位現值；首次發現倉位時自動查鏈取得建倉時間戳
+1. **PoolScanner**：從 DexScreener 取得 TVL；GeckoTerminal 取得成交量（The Graph subgraph 已停用）；計算各池 APR
+2. **BBEngine**：先行計算所有池的布林通道（避免 PositionScanner 重複呼叫 GeckoTerminal），維護 in-memory 小時價格緩衝區，計算 20 SMA + EWMA 平滑 stdDev（α=0.3, β=0.7）+ 動態 k 值，產出建議 Tick 區間
+3. **PositionScanner**：掃描多個錢包的 LP NFT（含 `TRACKED_TOKEN_<tokenId>` 鎖倉倉位）；自動偵測 `isStaked`（ownerOf 回傳合約地址）；追蹤第三幣獎勵（CAKE via MasterChef `pendingCake`、AERO via gauge `earned`）；Aerodrome staked 手續費走 `gauge.pendingFees` → `collect.staticCall` → `tokensOwed` 四級策略；首次發現倉位時透過 `ChainEventScanner` 批次查鏈取得建倉時間戳
 4. **RiskManager**：取得即時 Gas 費用（`fetchGasCostUSD`）；計算 Health Score、IL Breakeven Days、動態 EOQ Compound Threshold、drift 警告
 5. **TelegramBot**：合併所有倉位為單一報告推播，支援 `/sort` 排序切換
 
@@ -202,30 +199,33 @@ PoolScanner → BBEngine → PositionScanner → RiskManager → TelegramBot
 [2026-03-07 10:00] 倉位監控報告 (2 個倉位 | 排序: 倉位大小 ↓)
 
 📊 總覽  2 倉位 · 2 錢包
-💼 總倉位 $20,200  |  Unclaimed $6.7
+💼 總倉位 $20,200  |  本金 $18,000  |  Unclaimed $6.7
+💱 ETH $2,053  BTC $70,387  CAKE $1.380  AERO $0.324
 💰 總獲利 +$276.8 (+1.38%) 🟢
 
 ━━ #1 PancakeSwap 0.01% ━━
-倉位 $12,400 | 本金 $10,000 | 健康 94/100
-⏳ 開倉 4天3小時 · 獲利 +1.82%
 👛 0xaBcD...1234 · #1675918
+⏳ 開倉 4天3小時
 💹 當前 0.02921 | Low Vol (震盪市)
-  ├ 你的 0.02803 ~ 0.03054
-  └ BB   0.02628 ~ 0.03213
-💸 Unclaimed $4.6 | IL +$18.2 🟢
-⏱ Breakeven 盈利中
-🔄 Compound ✅ $4.6 > $0.1
+ ├ 你的 0.02803 ~ 0.03054
+ └ 建議 0.02628 ~ 0.03213
+💼 倉位 $12,400 | 本金 $10,000 | 健康 94/100
+⌛  Breakeven 盈利中 · 獲利 +1.82%
+💸 淨損益 +$18.2 🟢 | 無常損失 -$13.0 🔴
+🔄 未領取手續費 $4.62 ✅ > $0.1
+     0.0₃2719 WETH ($0.56)
+     0.0₅774 cbBTC ($0.54)
 
 ━━ #2 Aerodrome 0.0085% ━━
-倉位 $7,800 | 本金 $8,000 | 健康 61/100
-⏳ 開倉 1天0小時 · 獲利 -1.22%
-👛 0xdEfA...5678 · #56328282
+👛 0xdEfA...5678 · #56328282 🔒
+⏳ 開倉 1天0小時
 💹 當前 0.02905 | High Vol (趨勢市)
-  ├ 你的 0.02700 ~ 0.03100
-  └ BB   0.02550 ~ 0.03300
-💸 Unclaimed $2.1 | IL -$95.0 🔴
-⏱ Breakeven 22天
-🔄 Compound ❌ $2.1 < $5.8
+ ├ 你的 0.02700 ~ 0.03100
+ └ 建議 0.02550 ~ 0.03300
+💼 倉位 $7,800 | 本金 $8,000 | 健康 61/100
+⌛  Breakeven 22天
+💸 淨損益 -$95.0 🔴
+🔄 未領取手續費 $2.10 ❌ < $5.8
 ⚠️ DRIFT 重疊 71.3% (建議依 BB 重建倉)
 
 📊 各池收益排行:
@@ -233,13 +233,17 @@ PoolScanner → BBEngine → PositionScanner → RiskManager → TelegramBot
 🥈 Aerodrome 0.0085% — APR 29.4% | TVL $987K ◀ 你的倉位
 🥉 Uniswap 0.05% — APR 18.6% | TVL $543K
 
-⏱ 資料更新時間:
+⌛ 資料更新時間:
 - Pool: 10:00 | Position: 10:00
 - BB Engine: 10:00 | Risk: 10:00
 ```
 
 **選用欄位（有條件才顯示）：**
-- `⏳ 開倉 ... · 獲利`：需設定 `INITIAL_INVESTMENT_<tokenId>` 且倉位有建倉時間戳
+- `💱` 幣價行：有任意 BBResult 時顯示即時 ETH / BTC / CAKE / AERO 價格
+- `⏳ 開倉`：需設定 `INITIAL_INVESTMENT_<tokenId>` 且倉位有建倉時間戳；`· 獲利 +X.XX%` 在本金已設時顯示
+- `🔒`：倉位 NFT 已質押至 Gauge / MasterChef（`isStaked = true`）
+- `無常損失`：在 `💸 淨損益` 同行，僅當初始本金已設時顯示
+- 未領取手續費逐幣明細：各幣種金額 > 0 時顯示，使用下標零緊湊格式（如 `0.0₃2719 WETH`）
 - `⚠️ RED_ALERT`：IL Breakeven Days > 30 天，建議減倉
 - `⚠️ HIGH_VOLATILITY_AVOID`：當前頻寬 > 2× 30D 平均頻寬，建議觀望
 - `⚠️ DRIFT`：BB 重疊度 < 80%，附再平衡策略名稱與 Gas 估算
@@ -299,7 +303,7 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
 | `volCacheBB` | 6 小時 | BBEngine 每次計算後 | `BBEngine.ts` |
 | `volCachePool` | 30 分鐘 | PoolScanner 每次計算後 | `PoolScanner.ts` |
 | `priceBuffer` | 永久（滾動保留最近 24 筆） | 每次 tick 更新時 | `BBEngine.ts` |
-| `openTimestamps` | 永久 | 首次發現倉位時 | `OpenTimestampService.ts` |
+| `openTimestamps` | 永久 | 首次發現倉位時 | `ChainEventScanner.ts` |
 | `sortBy` | 永久 | `/sort` 指令觸發時 | `TelegramBot.ts` |
 | `discoveredPositions` | 永久 | 每次 5 分鐘週期 | `PositionScanner.ts` |
 | `syncedWallets` | 永久 | 每次 5 分鐘週期 | `index.ts` |
@@ -335,10 +339,9 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
 ## 資料來源優先順序
 
 **成交量 / APR**
-1. The Graph（Uniswap Messari Schema 或 Native Schema）
-2. GeckoTerminal OHLCV Day（最多 3 次重試，10s 延遲）
-3. 過期快取（stale cache）
-4. 零值
+1. GeckoTerminal OHLCV Day（最多 3 次重試，10s 延遲；The Graph subgraph 已停用）
+2. 過期快取（stale cache）
+3. 零值
 
 **BB 波動率**
 1. GeckoTerminal OHLCV Day（30 天）
@@ -354,10 +357,10 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
 
 | 市場狀態 | 條件 | k 值 |
 |----------|------|------|
-| 低波動 | 30D 年化波動率 < 50% | `k = 1.2` |
-| 高波動 | 30D 年化波動率 >= 50% | `k = 1.8` |
+| 低波動 | 30D 年化波動率 < 50% | `k = 1.5` |
+| 高波動 | 30D 年化波動率 >= 50% | `k = 2.0` |
 
-價格區間上限為 SMA ±10%（`maxOffset = sma * 0.10`）。
+價格區間上限為 SMA ±10%（`maxOffset = sma * 0.10`）。stdDev 在資料 ≥ 5 筆時使用 EWMA（α=0.3, β=0.7）平滑計算；不足時由 30D 年化波動率換算 1H stdDev（`sma × vol / √8760`）。
 
 ---
 
@@ -390,7 +393,7 @@ TRACKED_TOKEN_789012=Aerodrome
 ```
 
 系統會在錢包掃描完成後，額外從鏈上讀取這些 Token ID 並加入監測清單。
-開倉時間戳透過 `OpenTimestampService` 批次查詢 NFT `Transfer(from=0x0)` 事件。同一 NPM 合約的所有 tokenId 合併成單次 `getLogs`（`topics[3]` OR filter），大幅減少 RPC 呼叫次數。結果快取並存入 `data/state.json`。
+開倉時間戳透過 `ChainEventScanner`（`OpenTimestampHandler`）批次查詢 NFT `Transfer(from=0x0)` 事件。同一 NPM 合約的所有 tokenId 合併成單次 `getLogs`（`topics[3]` OR filter），支援分塊掃描（2000 blocks/chunk）與連續失敗中止（3 次），大幅減少 RPC 呼叫次數。結果快取並存入 `data/state.json`。
 
 ---
 

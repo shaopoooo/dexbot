@@ -18,16 +18,16 @@ export interface BBResult {
   tickUpper: number;
   ethPrice: number;
   cbbtcPrice: number;
+  cakePrice: number;
+  aeroPrice: number;
   minPriceRatio: number;
   maxPriceRatio: number;
   isFallback?: boolean;
   regime: string;
 }
 
-const VOL_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const PRICE_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes（短於 5m cron，確保每個週期拿新價格）
 
-let tokenPriceCache: { ethPrice: number; cbbtcPrice: number; expiresAt: number } | null = null;
+let tokenPriceCache: { ethPrice: number; cbbtcPrice: number; cakePrice: number; aeroPrice: number; expiresAt: number } | null = null;
 
 /** Compute annualized vol from a list of prices (closes). */
 function calcVol(prices: number[]): number {
@@ -48,8 +48,8 @@ async function fetchDailyVol(poolAddress: string, dex: 'Uniswap' | 'PancakeSwap'
 
   const tag = poolAddress.slice(0, 10);
   const save = (vol: number) => {
-    bbVolCache.set(key, { vol, expiresAt: Date.now() + VOL_CACHE_TTL_MS });
-    log.info(`💾 30D vol  ${tag}  ${(vol * 100).toFixed(1)}%  (12h cache)`);
+    bbVolCache.set(key, { vol, expiresAt: Date.now() + config.BB_VOL_CACHE_TTL_MS });
+    log.info(`💾 30D vol  ${tag}  ${(vol * 100).toFixed(1)}%  (${config.BB_VOL_CACHE_TTL_MS / 3600000}h cache)`);
     return vol;
   };
 
@@ -57,7 +57,7 @@ async function fetchDailyVol(poolAddress: string, dex: 'Uniswap' | 'PancakeSwap'
     try {
       log.info(`🌐 30D vol  ${tag}  attempt ${attempt}/3`);
       const res = await axios.get(
-        `https://api.geckoterminal.com/api/v2/networks/base/pools/${key}/ohlcv/day?limit=30`,
+        `${config.API_URLS.GECKOTERMINAL_OHLCV}/${key}/ohlcv/day?limit=30`,
         { timeout: 8000 }
       );
 
@@ -79,8 +79,8 @@ async function fetchDailyVol(poolAddress: string, dex: 'Uniswap' | 'PancakeSwap'
     }
   }
 
-  log.warn(`vol fallback 50%  ${tag}`);
-  return 0.5;
+  log.warn(`vol fallback ${(config.BB_FALLBACK_VOL * 100).toFixed(0)}%  ${tag}`);
+  return config.BB_FALLBACK_VOL;
 }
 
 /**
@@ -105,14 +105,14 @@ class PriceBuffer {
     }
 
     // Get current hour timestamp (floor to nearest hour)
-    const currentHour = Math.floor(Date.now() / (1000 * 60 * 60)) * (1000 * 60 * 60);
+    const currentHour = Math.floor(Date.now() / config.ONE_HOUR_MS) * config.ONE_HOUR_MS;
     const poolBuffer = this.buffer.get(key)!;
 
     // Always overwrite the current hour with the latest price (acts as the "close" if it's the last update in that hour)
     poolBuffer.set(currentHour, price);
 
     // Prune old hours (keep only last 24 hours to save memory)
-    const cutoff = currentHour - (24 * 60 * 60 * 1000);
+    const cutoff = currentHour - config.ONE_DAY_MS;
     for (const [hourTimestamp] of poolBuffer.entries()) {
       if (hourTimestamp < cutoff) {
         poolBuffer.delete(hourTimestamp);
@@ -153,8 +153,7 @@ class PriceBuffer {
     // Sort by timestamp
     const sortedHours = Array.from(poolBuffer.entries()).sort((a, b) => a[0] - b[0]);
 
-    // Take the last 20
-    const last20 = sortedHours.slice(-20).map(entry => entry[1]);
+    const last20 = sortedHours.slice(-config.BB_HOURLY_WINDOW).map(entry => entry[1]);
     return last20;
   }
 
@@ -212,7 +211,7 @@ export class BBEngine {
 
       // 2. 先取得 30D 年化波動率（k 值與 stdDev fallback 都需要）
       const annualizedVol = await fetchDailyVol(poolAddress, dex);
-      const k = annualizedVol < 0.50 ? 1.2 : 1.8;
+      const k = annualizedVol < config.BB_VOL_THRESHOLD ? config.BB_K_LOW_VOL : config.BB_K_HIGH_VOL;
       const regime = k <= 1.5 ? 'Low Vol (震盪市)' : 'High Vol (趨勢市)';
 
       // 3. SMA：用現有資料計算，不足時以當前價格替代
@@ -223,61 +222,58 @@ export class BBEngine {
       // 4. stdDev：資料 >= 5 筆用 EWMA 平滑後計算；不足時從 30D 年化波動率換算 1H stdDev
       //    annualizedVol = hourlyStdDev × √(365 × 24)  →  hourlyStdDev = sma × annualizedVol / √8760
       let stdDev1H: number;
-      if (prices1H.length >= 5) {
+      if (prices1H.length >= config.MIN_CANDLES_FOR_EWMA) {
         let smoothedPrices = [...prices1H];
         for (let i = 1; i < smoothedPrices.length; i++) {
-          smoothedPrices[i] = 0.3 * smoothedPrices[i] + 0.7 * smoothedPrices[i - 1];
+          smoothedPrices[i] = config.EWMA_ALPHA * smoothedPrices[i] + config.EWMA_BETA * smoothedPrices[i - 1];
         }
         const variance1H = smoothedPrices.reduce((sum: number, p: number) => sum + Math.pow(p - sma, 2), 0) / smoothedPrices.length;
         stdDev1H = Math.sqrt(variance1H);
       } else {
         // 冷啟動：用 30D vol 換算 1H stdDev，regime 仍有效
-        stdDev1H = sma * annualizedVol / Math.sqrt(365 * 24);
+        stdDev1H = sma * annualizedVol / Math.sqrt(365 * 24); // √(365×24) = √8760 hourly annualization
         log.info(`📊 vol-derived stdDev  ${poolAddress.slice(0, 10)}  candles=${prices1H.length}/20  stdDev=${stdDev1H.toExponential(3)}`);
       }
 
-      const maxOffset = sma * 0.10; // ±10% cap
+      const maxOffset = sma * config.BB_MAX_OFFSET_PCT;
       const upperPrice = Math.min(sma + maxOffset, sma + (k * stdDev1H));
       // 不使用絕對最小值（如 0.00000001），避免 tick-ratio 極小的幣對（如 WETH/cbBTC ≈ 2.9e-12）
       // 被 clamp 到遠大於 SMA 的下界，導致 tickOffsetLower 為負、tick 範圍倒置。
       // sma - maxOffset = 0.9 × sma 恆正，無需額外保護。
       const lowerPrice = Math.max(sma - maxOffset, sma - (k * stdDev1H));
 
-      // Calculate the percentage offset of the bounds from the current price/SMA
-      // Since price = 1.0001^tick, a % change in price corresponds to a constant tick offset
-      // Delta Tick = log(Price2/Price1) / log(1.0001)
-      const tickOffsetUpper = Math.round(Math.log(upperPrice / sma) / Math.log(1.0001));
-      const tickOffsetLower = Math.round(Math.log(sma / lowerPrice) / Math.log(1.0001));
-
-      // If price of Token0 is rising relative to Token1, tick usually increases.
-      // E.g cbBTC vs WETH (Token0 is usually cbBTC).
-      const tickUpperRaw = currentTick + tickOffsetUpper;
-      const tickLowerRaw = currentTick - tickOffsetLower;
+      // Convert BB price bounds directly to ticks: tick = log(price) / log(1.0001)
+      // This anchors the band to the SMA, not currentTick, so all positions on the
+      // same pool always see the same BB regardless of when they are scanned.
+      const tickUpperRaw = Math.round(Math.log(upperPrice) / Math.log(1.0001));
+      const tickLowerRaw = Math.round(Math.log(lowerPrice) / Math.log(1.0001));
 
       const tickLower = nearestUsableTick(tickLowerRaw, tickSpacing);
       const tickUpper = nearestUsableTick(tickUpperRaw, tickSpacing);
 
-      // Fetch current WETH and cbBTC prices from DexScreener（5分鐘快取，避免每個 pool 重複呼叫）
-      let ethPrice = 0;
-      let cbbtcPrice = 0;
+      // Fetch WETH / cbBTC / CAKE / AERO prices from DexScreener（5分鐘快取）
+      let ethPrice = 0, cbbtcPrice = 0, cakePrice = 0, aeroPrice = 0;
       if (tokenPriceCache && Date.now() < tokenPriceCache.expiresAt) {
-        ethPrice = tokenPriceCache.ethPrice;
-        cbbtcPrice = tokenPriceCache.cbbtcPrice;
+        ({ ethPrice, cbbtcPrice, cakePrice, aeroPrice } = tokenPriceCache);
       } else {
         try {
-          const [wethRes, cbbtcRes] = await Promise.all([
-            axios.get('https://api.dexscreener.com/latest/dex/tokens/0x4200000000000000000000000000000000000006', { timeout: 5000 }),
-            axios.get('https://api.dexscreener.com/latest/dex/tokens/0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf', { timeout: 5000 }),
+          const bestPrice = (pairs: any[]) =>
+            parseFloat((pairs?.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0])?.priceUsd || '0');
+          const [wethRes, cbbtcRes, cakeRes, aeroRes] = await Promise.all([
+            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.WETH}`,  { timeout: 5000 }),
+            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.CBBTC}`, { timeout: 5000 }),
+            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.CAKE}`,  { timeout: 5000 }),
+            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.AERO}`,  { timeout: 5000 }),
           ]);
-          if (wethRes.data?.pairs?.length > 0)
-            ethPrice = parseFloat(wethRes.data.pairs[0].priceUsd);
-          if (cbbtcRes.data?.pairs?.length > 0)
-            cbbtcPrice = parseFloat(cbbtcRes.data.pairs[0].priceUsd);
-          tokenPriceCache = { ethPrice, cbbtcPrice, expiresAt: Date.now() + PRICE_CACHE_TTL_MS };
-          log.info(`💹 WETH $${ethPrice.toFixed(0)}  cbBTC $${cbbtcPrice.toFixed(0)}`);
+          ethPrice   = bestPrice(wethRes.data?.pairs);
+          cbbtcPrice = bestPrice(cbbtcRes.data?.pairs);
+          cakePrice  = bestPrice(cakeRes.data?.pairs);
+          aeroPrice  = bestPrice(aeroRes.data?.pairs);
+          tokenPriceCache = { ethPrice, cbbtcPrice, cakePrice, aeroPrice, expiresAt: Date.now() + config.TOKEN_PRICE_CACHE_TTL_MS };
+          log.info(`💹 WETH $${ethPrice.toFixed(0)}  cbBTC $${cbbtcPrice.toFixed(0)}  CAKE $${cakePrice.toFixed(3)}  AERO $${aeroPrice.toFixed(3)}`);
         } catch (e: any) {
           log.warn(`token price fetch failed: ${e.message}`);
-          if (tokenPriceCache) { ethPrice = tokenPriceCache.ethPrice; cbbtcPrice = tokenPriceCache.cbbtcPrice; }
+          if (tokenPriceCache) ({ ethPrice, cbbtcPrice, cakePrice, aeroPrice } = tokenPriceCache);
         }
       }
 
@@ -294,6 +290,8 @@ export class BBEngine {
         tickUpper,
         ethPrice,
         cbbtcPrice,
+        cakePrice,
+        aeroPrice,
         minPriceRatio,
         maxPriceRatio,
         regime
@@ -310,13 +308,12 @@ export class BBEngine {
    * Uses the current tick as the SMA and creates a standard 10% wide band.
    */
   private static createFallbackBB(currentTick: number, tickSpacing: number): BBResult {
-    const k = 2.0;
-    const volatility30D = 0.5;
+    const k = config.BB_FALLBACK_K;
+    const volatility30D = config.BB_FALLBACK_VOL;
     const currentPrice = Math.pow(1.0001, currentTick);
 
-    // Arbitrary +/- 1000 ticks (~10%) for the fallback band
-    const tickLowerRaw = currentTick - 1000;
-    const tickUpperRaw = currentTick + 1000;
+    const tickLowerRaw = currentTick - config.BB_FALLBACK_TICK_OFFSET;
+    const tickUpperRaw = currentTick + config.BB_FALLBACK_TICK_OFFSET;
 
     return {
       sma: currentPrice,
@@ -328,6 +325,8 @@ export class BBEngine {
       tickUpper: nearestUsableTick(tickUpperRaw, tickSpacing),
       ethPrice: 0,
       cbbtcPrice: 0,
+      cakePrice: 0,
+      aeroPrice: 0,
       minPriceRatio: 0,
       maxPriceRatio: 0,
       isFallback: true,

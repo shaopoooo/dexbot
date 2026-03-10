@@ -7,10 +7,35 @@ import { RebalanceService, RebalanceSuggestion } from './rebalance';
 import { PnlCalculator } from './PnlCalculator';
 import { createServiceLogger, positionLogger } from '../utils/logger';
 import { rpcProvider, rpcRetry, delay, nextProvider } from '../utils/rpcProvider';
-import { OpenTimestampService, TimestampRequest } from './OpenTimestampService';
+import { chainEventScanner, openTimestampHandler, ScanRequest } from './ChainEventScanner';
+import axios from 'axios';
 import { DiscoveredPosition } from '../utils/stateManager';
 
 const log = createServiceLogger('PositionScanner');
+
+// CAKE price cache（5 分鐘 TTL）
+let cakePriceCache: { price: number; expiresAt: number } | null = null;
+
+async function fetchCakePrice(): Promise<number> {
+    if (cakePriceCache && Date.now() < cakePriceCache.expiresAt) return cakePriceCache.price;
+    try {
+        const res = await axios.get(
+            `${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.CAKE}`,
+            { timeout: 5000, headers: { 'User-Agent': 'DexBot/1.0' } }
+        );
+        const pairs: any[] = res.data?.pairs || [];
+        // 取 liquidity 最高的 pair
+        const best = pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+        const price = parseFloat(best?.priceUsd || '0');
+        if (price > 0) {
+            cakePriceCache = { price, expiresAt: Date.now() + 5 * 60 * 1000 };
+            return price;
+        }
+    } catch (e: any) {
+        log.warn(`fetchCakePrice failed: ${e.message}`);
+    }
+    return cakePriceCache?.price || 0;
+}
 
 export interface PositionRecord {
     tokenId: string;
@@ -36,8 +61,12 @@ export interface PositionRecord {
     // Fees & IL
     unclaimed0: string;
     unclaimed1: string;
+    unclaimed2: string;       // CAKE rewards (PancakeSwap only), '0' otherwise
     unclaimedFeesUSD: number;
-    collectedFeesUSD: number;
+    fees0USD: number;
+    fees1USD: number;
+    fees2USD: number;         // CAKE USD value
+    token2Symbol: string;     // 'CAKE' or ''
 
     // Risk
     overlapPercent: number;
@@ -49,9 +78,11 @@ export interface PositionRecord {
     // Metadata
     lastUpdated: number;
     openTimestampMs?: number; // 建倉區塊時間 (ms)，從鏈上 Transfer 事件取得
+    apr?: number;         // Pool APR (from PoolScanner)
     volSource: string;    // e.g. 'The Graph (PancakeSwap)', 'GeckoTerminal', 'stale cache'
     priceSource: string;  // e.g. 'The Graph (Uniswap)', 'GeckoTerminal'
     bbFallback: boolean;  // True if BBEngine failed and returned a fallback
+    isStaked: boolean;    // True if NFT is held by a contract (gauge / masterchef)
     rebalance?: RebalanceSuggestion;
 }
 
@@ -219,8 +250,13 @@ export class PositionScanner {
             positionValueUSD: 0,
             unclaimed0: '0',
             unclaimed1: '0',
+            unclaimed2: '0',
             unclaimedFeesUSD: 0,
-            collectedFeesUSD: 0,
+            fees0USD: 0,
+            fees1USD: 0,
+            fees2USD: 0,
+            token2Symbol: '',
+            isStaked: false,
             overlapPercent: 0,
             ilUSD: null,
             breakevenDays: 0,
@@ -297,11 +333,17 @@ export class PositionScanner {
         }
 
         // Phase 2: batch-fetch open timestamps — one scan per NPM contract
-        const timestampRequests: TimestampRequest[] = discovered
+        const timestampRequests: ScanRequest[] = discovered
             .filter(d => !!config.NPM_ADDRESSES[d.dex])
             .map(d => ({ tokenId: d.tokenId, npmAddress: config.NPM_ADDRESSES[d.dex], dex: d.dex }));
 
-        const timestamps = await OpenTimestampService.fetchAll(timestampRequests);
+        await chainEventScanner.scan(timestampRequests);
+
+        const timestamps: Record<string, number> = {};
+        for (const r of timestampRequests) {
+            const ts = openTimestampHandler.getCachedTimestamp(`${r.tokenId}_${r.dex}`);
+            if (ts !== undefined) timestamps[`${r.tokenId}_${r.dex}`] = ts;
+        }
 
         // Phase 3: build seedPositions
         const seedPositions: PositionRecord[] = discovered.map(d => ({
@@ -322,8 +364,13 @@ export class PositionScanner {
             positionValueUSD: 0,
             unclaimed0: '0',
             unclaimed1: '0',
+            unclaimed2: '0',
             unclaimedFeesUSD: 0,
-            collectedFeesUSD: 0,
+            fees0USD: 0,
+            fees1USD: 0,
+            fees2USD: 0,
+            token2Symbol: '',
+            isStaked: false,
             overlapPercent: 0,
             ilUSD: null,
             breakevenDays: 0,
@@ -347,40 +394,147 @@ export class PositionScanner {
         return this.positions;
     }
 
+    /** Translate Chinese regime label to English. */
+    private static regimeEn(regime: string): string {
+        return regime
+            .replace('震盪市', 'Ranging')
+            .replace('趨勢市', 'Trending')
+            .replace('資料累積中', 'Accumulating');
+    }
+
+    /**
+     * Format a raw token amount with compact subscript-zero notation for small values.
+     * e.g.  0.0002719  →  "0.0₃2719 WETH ($0.56)"
+     *        0.00000774 →  "0.0₅774 cbBTC ($0.54)"
+     *        0.2194     →  "0.2194 CAKE ($0.30)"
+     * Returns null if the amount is zero.
+     */
+    private static formatTokenCompact(rawStr: string, decimals: number, symbol: string, usdValue: number): string | null {
+        const raw = BigInt(rawStr);
+        if (raw === 0n) return null;
+
+        const divisor = BigInt(10) ** BigInt(decimals);
+        const whole = Number(raw / divisor);
+        const frac  = Number(raw % divisor) / Math.pow(10, decimals);
+        const amount = whole + frac;
+        if (amount === 0) return null;
+
+        let display: string;
+        if (amount < 0.01 && whole === 0) {
+            // Count leading zeros in the fractional part
+            const fracStr = (raw % divisor).toString().padStart(decimals, '0');
+            const leadingZeros = (fracStr.match(/^0+/) ?? [''])[0].length;
+            if (leadingZeros >= 2) {
+                const sigDigits = fracStr.slice(leadingZeros).replace(/0+$/, '').slice(0, 4);
+                const SUB = '₀₁₂₃₄₅₆₇₈₉';
+                const subscript = String(leadingZeros).split('').map(d => SUB[parseInt(d)]).join('');
+                display = `0.0${subscript}${sigDigits}`;
+            } else {
+                display = amount.toPrecision(4);
+            }
+        } else {
+            // 4 significant figures, trim trailing zeros
+            display = parseFloat(amount.toPrecision(4)).toString();
+        }
+
+        return `${display} ${symbol} ($${usdValue.toFixed(2)})`;
+    }
+
+    /** Format a single position as a plain-text block for positions.log. */
+    private static formatPositionLog(pos: PositionRecord): string {
+        const now = new Date();
+        const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+        const label = `${pos.dex} ${(pos.feeTier * 100).toFixed(4).replace(/\.?0+$/, '')}%`;
+        const walletShort = pos.ownerWallet
+            ? `${pos.ownerWallet.slice(0, 6)}...${pos.ownerWallet.slice(-4)}`
+            : 'unknown';
+
+        const openInfo = PnlCalculator.calculateOpenInfo(pos.tokenId, pos.openTimestampMs, pos.ilUSD);
+        const openedStr = openInfo
+            ? (openInfo.days > 0 ? `${openInfo.days}d ${openInfo.hours}h` : `${openInfo.hours}h`)
+            : 'unknown';
+
+        const initialCapital = PnlCalculator.getInitialCapital(pos.tokenId);
+        const posValue = pos.positionValueUSD > 0 ? `$${pos.positionValueUSD.toFixed(0)}` : 'N/A';
+        const capStr   = initialCapital !== null ? `$${initialCapital.toFixed(0)}` : 'N/A';
+        const aprStr   = pos.apr !== undefined ? `${(pos.apr * 100).toFixed(1)}%` : 'N/A';
+
+        const pnlSign  = pos.ilUSD === null ? '' : pos.ilUSD >= 0 ? '+' : '-';
+        const pnlAbs   = pos.ilUSD === null ? 'N/A' : `$${Math.abs(pos.ilUSD).toFixed(1)}`;
+        const pnlTag   = pos.ilUSD === null ? '' : pos.ilUSD >= 0 ? '[+]' : '[-]';
+        const pnlStr   = pos.ilUSD === null ? 'N/A (no capital set)' : `${pnlSign}${pnlAbs} ${pnlTag}`;
+
+        const bbBound = (pos.bbMinPrice && pos.bbMaxPrice)
+            ? `${pos.bbMinPrice} ~ ${pos.bbMaxPrice}${pos.bbFallback ? ' [fallback]' : ''}`
+            : 'N/A';
+
+        const profitStr = (openInfo?.profitRate !== null && openInfo?.profitRate !== undefined)
+            ? ` | Profit: ${openInfo.profitRate >= 0 ? '+' : ''}${openInfo.profitRate.toFixed(2)}%`
+            : '';
+        const breakevenStr = (pos.ilUSD !== null && pos.ilUSD >= 0) ? 'Profitable' : `${pos.breakevenDays}d`;
+        const compoundStr  = pos.unclaimedFeesUSD >= config.EOQ_THRESHOLD ? 'YES' : 'no';
+
+        const REBALANCE_STRATEGY: Record<string, string> = {
+            wait:              'Wait (expect reversion)',
+            dca:               'DCA buy-in',
+            withdrawSingleSide:'Withdraw & single-side LP',
+            avoidSwap:         'Avoid direct swap',
+        };
+
+        const lines: string[] = [];
+        lines.push(`[${timeStr}] ━━ #${pos.tokenId} ${label} ━━`);
+        lines.push(`  Value: ${posValue} | Capital: ${capStr} | APR: ${aprStr} | Health: ${pos.healthScore}/100`);
+        lines.push(`  Wallet:    ${walletShort}  (${openedStr})`);
+        lines.push(`  Price:     ${pos.currentPriceStr} | ${this.regimeEn(pos.regime)}`);
+        lines.push(`    Your:    ${pos.minPrice} ~ ${pos.maxPrice}`);
+        lines.push(`    BB:      ${bbBound}`);
+        lines.push(`  PnL:       ${pnlStr}${profitStr}`);
+        lines.push(`  Unclaimed: $${pos.unclaimedFeesUSD.toFixed(1)} | Breakeven: ${breakevenStr} | Compound: ${compoundStr}`);
+        const TOKEN_DEC: Record<string, number> = { WETH: 18, cbBTC: 8, CAKE: 18, AERO: 18 };
+        const t0line = this.formatTokenCompact(pos.unclaimed0, TOKEN_DEC[pos.token0Symbol] ?? 18, pos.token0Symbol, pos.fees0USD);
+        const t1line = this.formatTokenCompact(pos.unclaimed1, TOKEN_DEC[pos.token1Symbol] ?? 18, pos.token1Symbol, pos.fees1USD);
+        const t2line = pos.token2Symbol ? this.formatTokenCompact(pos.unclaimed2, TOKEN_DEC[pos.token2Symbol] ?? 18, pos.token2Symbol, pos.fees2USD) : null;
+        if (t0line) lines.push(`     ${t0line}`);
+        if (t1line) lines.push(`     ${t1line}`);
+        if (t2line) lines.push(`     ${t2line}`);
+        if (pos.overlapPercent < RiskManager.DRIFT_WARNING_PCT) {
+            lines.push(`  [!] DRIFT WARNING: overlap ${pos.overlapPercent.toFixed(1)}% < ${RiskManager.DRIFT_WARNING_PCT}%`);
+        }
+        if (pos.rebalance) {
+            const rb = pos.rebalance;
+            const strategy = REBALANCE_STRATEGY[rb.recommendedStrategy] ?? rb.recommendedStrategy;
+            lines.push(`  [!] REBALANCE: ${strategy} (drift ${rb.driftPercent > 0 ? '+' : ''}${rb.driftPercent.toFixed(1)}%)`);
+        }
+        lines.push('─'.repeat(44));
+
+        return lines.join('\n');
+    }
+
     /**
      * Log position snapshots to the dedicated positions.log (append-only history).
+     * Each 5-minute cycle is preceded by a timestamped header with token prices.
      */
-    private static logPositionSnapshots(positions: PositionRecord[]) {
+    private static logPositionSnapshots(positions: PositionRecord[], bb?: BBResult | null) {
+        const now = new Date().toISOString().replace('T', ' ').slice(0, 16);
+        const fmtPrice = (p: number) => p >= 100
+            ? `$${Math.round(p).toLocaleString('en-US')}`
+            : `$${p.toFixed(3)}`;
+        const pricesLine = bb
+            ? `  ETH ${fmtPrice(bb.ethPrice)}  BTC ${fmtPrice(bb.cbbtcPrice)}  CAKE ${fmtPrice(bb.cakePrice)}  AERO ${fmtPrice(bb.aeroPrice)}`
+            : '';
+        const sep = '═'.repeat(44);
+        positionLogger.info(
+            `\n${sep}\n  [${now}] Snapshot  (${positions.length} position${positions.length !== 1 ? 's' : ''})\n${pricesLine}\n${sep}`
+        );
         for (const pos of positions) {
-            positionLogger.info('position_snapshot', {
-                tokenId: pos.tokenId,
-                dex: pos.dex,
-                pool: pos.poolAddress,
-                feeTier: pos.feeTier,
-                liquidity: pos.liquidity,
-                currentTick: pos.currentTick,
-                tickLower: pos.tickLower,
-                tickUpper: pos.tickUpper,
-                price: pos.currentPriceStr,
-                minPrice: pos.minPrice,
-                maxPrice: pos.maxPrice,
-                positionValueUSD: pos.positionValueUSD,
-                unclaimed0: pos.unclaimed0,
-                unclaimed1: pos.unclaimed1,
-                unclaimedFeesUSD: pos.unclaimedFeesUSD,
-                ilUSD: pos.ilUSD,
-                healthScore: pos.healthScore,
-                regime: pos.regime,
-                breakevenDays: pos.breakevenDays,
-                overlapPercent: pos.overlapPercent
-            });
+            positionLogger.info(this.formatPositionLog(pos));
         }
     }
 
     /**
      * Core routine to scan a specific NFT position, fetch live data, compute IL & BB overlap, and update the record.
      */
-    static async scanPosition(tokenId: string, dex: 'Uniswap' | 'PancakeSwap' | 'Aerodrome', precomputedBB?: BBResult | null): Promise<PositionRecord | null> {
+    static async scanPosition(tokenId: string, dex: 'Uniswap' | 'PancakeSwap' | 'Aerodrome', precomputedBB?: BBResult | null, openTimestampMs?: number, cycleCache?: Record<string, BBResult>): Promise<PositionRecord | null> {
         try {
             const npmAddress = config.NPM_ADDRESSES[dex];
             const npmContract = new ethers.Contract(npmAddress, config.NPM_ABI, nextProvider());
@@ -419,20 +573,130 @@ export class PositionScanner {
             }
 
             // 優先使用外部預計算的 BB（由 runBBEngine 統一計算），避免重複 API 呼叫
-            const bb = precomputedBB !== undefined
-                ? precomputedBB
-                : await BBEngine.computeDynamicBB(poolAddress, dex, tickSpacing, poolStats.tick);
+            // cycleCache 確保同一週期內相同池子只計算一次 BB，避免序列掃描時市價微動造成不同倉位顯示不同 BB
+            const poolKey = poolAddress.toLowerCase();
+            let bb: BBResult | null;
+            if (precomputedBB !== undefined) {
+                bb = precomputedBB;
+            } else if (cycleCache?.[poolKey] !== undefined) {
+                bb = cycleCache[poolKey];
+            } else {
+                bb = await BBEngine.computeDynamicBB(poolAddress, dex, tickSpacing, poolStats.tick);
+                if (bb && cycleCache) cycleCache[poolKey] = bb;
+            }
+
+            // 判斷 NFT 是否質押（ownerOf 返回非已知錢包 → 由合約持有）
+            const ownerIsWallet = config.WALLET_ADDRESSES.some(w => w.toLowerCase() === owner.toLowerCase());
+            const isStaked = !ownerIsWallet;
+            let depositorWallet = ownerIsWallet ? owner : '';
 
             // 手續費計算策略：
-            // - Aerodrome: collect.staticCall 始終回傳 0，改用 feeGrowth 數學計算
+            // - Aerodrome staked（ownerOf = gauge）：NPM 的 feeGrowthInside0LastX128 是 staking 時的舊
+            //   baseline，computePendingFees 會累積全部 pool 費用（遠大於實際可領），需改用
+            //   gauge.pendingFees(tokenId) 讀取 gauge 自己的 checkpoint。
+            // - Aerodrome unstaked：pool math（computePendingFees）準確可用。
             // - Uniswap / PancakeSwap: collect.staticCall({ from: owner }) 穩定可用
             let unclaimed0 = 0n;
             let unclaimed1 = 0n;
             if (dex === 'Aerodrome') {
-                const gaugeResult = await this.fetchAerodromeGaugeFees(tokenId, owner, poolAddress, position);
-                unclaimed0 = gaugeResult.fees0;
-                unclaimed1 = gaugeResult.fees1;
-                log.info(`💸 #${tokenId} aero fees  ${unclaimed0} / ${unclaimed1}  [${gaugeResult.source}]`);
+                try {
+                    if (isStaked) {
+                        // owner 是合約（gauge 或持有合約）
+                        // 策略：先查 voter.gauges(poolAddress) 取得 canonical gauge，
+                        //       嘗試 gauge.pendingFees(tokenId)（gauge 有自己的 checkpoint）；
+                        //       失敗則 fallback 到 pool math（對 unstaked 準確，staked 可能略高）。
+                        const voter = new ethers.Contract(config.AERO_VOTER_ADDRESS, config.AERO_VOTER_ABI, nextProvider());
+                        const canonicalGauge: string = await rpcRetry(
+                            () => voter.gauges(poolAddress),
+                            'aero.voter.gauges'
+                        );
+                        log.info(`🏛  #${tokenId} owner=${owner.slice(0, 10)}  canonicalGauge=${canonicalGauge?.slice(0, 10) ?? 'none'}`);
+
+                        let pendingFeesOk = false;
+                        if (canonicalGauge && canonicalGauge !== ethers.ZeroAddress) {
+                            const gauge = new ethers.Contract(canonicalGauge, config.AERO_GAUGE_ABI, nextProvider());
+
+                            // 查詢 depositor wallet：stakedContains 同時作為 pendingFees 的前置守衛
+                            // 若所有已知錢包都沒有質押此 tokenId，表示 gauge 持有 NFT 但 _stakes 為空
+                            // → 跳過 pendingFees（必然 revert），直接走 collect.staticCall
+                            if (!depositorWallet) {
+                                for (const wallet of config.WALLET_ADDRESSES) {
+                                    try {
+                                        if (await gauge.stakedContains(wallet, BigInt(tokenId))) {
+                                            depositorWallet = wallet;
+                                            break;
+                                        }
+                                    } catch {}
+                                }
+                            }
+
+                            if (depositorWallet) {
+                                // 確認有質押才呼叫 pendingFees
+                                // 不走 rpcRetry：gauge _stakes 不一致時會永久 revert，重試無意義
+                                try {
+                                    const [f0, f1] = await gauge.pendingFees(tokenId);
+                                    unclaimed0 = BigInt(f0);
+                                    unclaimed1 = BigInt(f1);
+                                    log.info(`💸 #${tokenId} aero fees  ${unclaimed0} / ${unclaimed1}  [canonical_gauge.pendingFees]`);
+                                    pendingFeesOk = true;
+                                } catch {
+                                    // gauge _stakes 狀態不一致（stakedContains=true 但 pendingFees revert）
+                                    // 靜默降級到 collect.staticCall
+                                }
+                            } else {
+                                log.info(`#${tokenId} gauge owns NFT but not staked → skip pendingFees`);
+                            }
+                        }
+
+                        if (!pendingFeesOk) {
+                            // gauge.pendingFees 失敗（tokenId 不在 gauge 內部 staking 紀錄中）：
+                            // 嘗試 collect.staticCall({from: owner})，gauge 是 NFT 持有者，NPM 授權允許。
+                            try {
+                                const MAX_UINT128 = 2n ** 128n - 1n;
+                                const collected = await npmContract.collect.staticCall(
+                                    {
+                                        tokenId,
+                                        recipient: owner,
+                                        amount0Max: MAX_UINT128,
+                                        amount1Max: MAX_UINT128,
+                                    },
+                                    { from: owner }
+                                );
+                                unclaimed0 = BigInt(collected.amount0);
+                                unclaimed1 = BigInt(collected.amount1);
+                                log.info(`💸 #${tokenId} aero fees  ${unclaimed0} / ${unclaimed1}  [npm.collect.staticCall from gauge]`);
+                                pendingFeesOk = true;
+                            } catch (e: any) {
+                                log.warn(`#${tokenId} collect.staticCall from gauge failed: ${e.message}`);
+                            }
+                        }
+
+                        if (!pendingFeesOk) {
+                            // 最終 fallback：tokensOwed（staking 時的舊快照，保守估計）
+                            unclaimed0 = BigInt(position.tokensOwed0);
+                            unclaimed1 = BigInt(position.tokensOwed1);
+                            log.warn(`#${tokenId} staked aero: pendingFees unavailable, using tokensOwed (conservative)`);
+                        }
+                    } else {
+                        // Unstaked：NPM 的 feeGrowthInsideLast 是最新的，pool math 準確
+                        const { fees0, fees1 } = await this.computePendingFees(
+                            poolAddress, dex, poolStats.tick,
+                            position.tickLower, position.tickUpper,
+                            BigInt(position.liquidity),
+                            BigInt(position.feeGrowthInside0LastX128),
+                            BigInt(position.feeGrowthInside1LastX128),
+                            BigInt(position.tokensOwed0),
+                            BigInt(position.tokensOwed1),
+                        );
+                        unclaimed0 = fees0;
+                        unclaimed1 = fees1;
+                        log.info(`💸 #${tokenId} aero fees  ${unclaimed0} / ${unclaimed1}  [pool.feeGrowth]`);
+                    }
+                } catch (e: any) {
+                    log.warn(`#${tokenId} aero fees failed: ${e.message} — using tokensOwed`);
+                    unclaimed0 = BigInt(position.tokensOwed0);
+                    unclaimed1 = BigInt(position.tokensOwed1);
+                }
             } else {
                 // Uniswap / PancakeSwap: use collect.staticCall with {from: owner}
                 try {
@@ -459,8 +723,8 @@ export class PositionScanner {
 
             // --- Address token decimal conversion for prices and amounts ---
             // On Base, WETH = 18 decimals, cbBTC = 8 decimals.
-            const wethAddr = '0x4200000000000000000000000000000000000006'.toLowerCase();
-            const cbbtcAddr = '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf'.toLowerCase();
+            const wethAddr = config.TOKEN_ADDRESSES.WETH.toLowerCase();
+            const cbbtcAddr = config.TOKEN_ADDRESSES.CBBTC.toLowerCase();
             const t0 = position.token0.toLowerCase();
             const t1 = position.token1.toLowerCase();
             const dec0 = (t0 === cbbtcAddr) ? 8 : 18;
@@ -475,9 +739,72 @@ export class PositionScanner {
             const price0 = (t0 === cbbtcAddr) ? cbbtcPrice : wethPrice;
             const price1 = (t1 === cbbtcAddr) ? cbbtcPrice : wethPrice;
 
-            const unclaimedFeesUSD = (fee0Normalized * price0) + (fee1Normalized * price1);
+            // 第三種代幣獎勵（CAKE for PancakeSwap, AERO for Aerodrome staked）
+            let unclaimed2 = 0n;
+            let fees2USD = 0;
+            let token2Symbol = '';
 
-            // (Moved calculation down below positionValueUSD)
+            // AERO 獎勵（Aerodrome staked：gauge.earned(depositorWallet, tokenId)）
+            if (dex === 'Aerodrome' && isStaked && depositorWallet) {
+                try {
+                    const voter = new ethers.Contract(config.AERO_VOTER_ADDRESS, config.AERO_VOTER_ABI, nextProvider());
+                    const canonicalGauge: string = await rpcRetry(
+                        () => voter.gauges(poolAddress),
+                        'aero.voter.gauges.earned'
+                    );
+                    if (canonicalGauge && canonicalGauge !== ethers.ZeroAddress) {
+                        const gauge = new ethers.Contract(canonicalGauge, config.AERO_GAUGE_ABI, nextProvider());
+                        const earned: bigint = await gauge.earned(depositorWallet, tokenId);
+                        unclaimed2 = BigInt(earned);
+                        if (unclaimed2 > 0n) {
+                            const aeroPrice = bb?.aeroPrice || 0;
+                            const aeroNormalized = Number(unclaimed2) / 1e18;
+                            fees2USD = aeroNormalized * aeroPrice;
+                            token2Symbol = 'AERO';
+                            log.info(`💸 #${tokenId} AERO  ${aeroNormalized.toFixed(6)}  ($${fees2USD.toFixed(3)})  [gauge.earned]`);
+                        }
+                    }
+                } catch (e: any) {
+                    log.warn(`#${tokenId} aero gauge.earned failed: ${e.message}`);
+                }
+            }
+
+            // CAKE 獎勵（PancakeSwap MasterChef V3）
+            // ownerOf 返回非已知錢包時，owner 本身就是 MasterChef（NFT 質押於其中）
+            // 直接對 owner 合約呼叫 pendingCake，不依賴硬編碼地址
+            if (dex === 'PancakeSwap') {
+                // 嘗試對象：1) ownerOf 回傳的合約（即 MasterChef）2) 設定檔的 fallback 地址
+                const candidates = ownerIsWallet
+                    ? (config.PANCAKE_MASTERCHEF_V3 ? [config.PANCAKE_MASTERCHEF_V3] : [])
+                    : [owner, ...(config.PANCAKE_MASTERCHEF_V3 && owner.toLowerCase() !== config.PANCAKE_MASTERCHEF_V3.toLowerCase() ? [config.PANCAKE_MASTERCHEF_V3] : [])];
+
+                for (const addr of candidates) {
+                    try {
+                        const masterchef = new ethers.Contract(addr, config.PANCAKE_MASTERCHEF_V3_ABI, nextProvider());
+                        const pending = await masterchef.pendingCake(tokenId);
+                        unclaimed2 = BigInt(pending);
+                        if (unclaimed2 > 0n) {
+                            const cakePrice = bb?.cakePrice || await fetchCakePrice();
+                            const cakeNormalized = Number(unclaimed2) / 1e18;
+                            fees2USD = cakeNormalized * cakePrice;
+                            token2Symbol = 'CAKE';
+                            log.info(`💸 #${tokenId} CAKE  ${cakeNormalized.toFixed(6)}  ($${fees2USD.toFixed(3)})  [${addr.slice(0, 10)}]`);
+                        }
+                        // 順便查詢 depositor wallet
+                        if (!depositorWallet) {
+                            try {
+                                const info = await masterchef.userPositionInfos(tokenId);
+                                if (info.user && info.user !== ethers.ZeroAddress) depositorWallet = info.user;
+                            } catch {}
+                        }
+                        break; // 成功即停止
+                    } catch {
+                        // 未質押或不是 MasterChef，繼續嘗試下一個
+                    }
+                }
+            }
+
+            const unclaimedFeesUSD = (fee0Normalized * price0) + (fee1Normalized * price1) + fees2USD;
 
             let overlapPercent = 0;
             let breakevenDays = 0;
@@ -530,8 +857,9 @@ export class PositionScanner {
             const exactIL = PnlCalculator.calculateAbsolutePNL(tokenId, positionValueUSD, unclaimedFeesUSD);
 
             // Fetch Risk Analysis
+            const initialCapital = PnlCalculator.getInitialCapital(tokenId) ?? positionValueUSD;
             const riskState = {
-                capital: 1000, // Mock Capital for now
+                capital: initialCapital,
                 tickLower: Number(position.tickLower),
                 tickUpper: Number(position.tickUpper),
                 unclaimedFees: unclaimedFeesUSD,
@@ -570,7 +898,8 @@ export class PositionScanner {
                 feeTier: feeTierForStats,
                 token0Symbol: t0 === cbbtcAddr ? 'cbBTC' : 'WETH',
                 token1Symbol: t1 === cbbtcAddr ? 'cbBTC' : 'WETH',
-                ownerWallet: owner,
+                ownerWallet: depositorWallet || owner,
+                isStaked,
 
                 liquidity: position.liquidity.toString(),
                 tickLower: Number(position.tickLower),
@@ -585,8 +914,12 @@ export class PositionScanner {
 
                 unclaimed0: unclaimed0.toString(),
                 unclaimed1: unclaimed1.toString(),
+                unclaimed2: unclaimed2.toString(),
                 unclaimedFeesUSD,
-                collectedFeesUSD: 0, // Needs event listener to track historical collections
+                fees0USD: fee0Normalized * price0,
+                fees1USD: fee1Normalized * price1,
+                fees2USD,
+                token2Symbol,
                 rebalance: rebalanceSuggestion,
 
                 overlapPercent,
@@ -596,6 +929,7 @@ export class PositionScanner {
                 regime,
 
                 lastUpdated: Date.now(),
+                apr: poolStats.apr,
                 volSource: poolStats.volSource ?? 'unknown',
                 priceSource: bb && !bb.isFallback ? `The Graph / GeckoTerminal` : 'RPC (Fallback)',
                 bbFallback: bb ? !!bb.isFallback : true,
@@ -641,14 +975,23 @@ export class PositionScanner {
             return;
         }
 
+        // 同一週期共用 BB cache：latestBBs 為基礎，掃描過程中新計算的 BB 也會存入，
+        // 確保同一池子的多個倉位得到完全相同的 BB 結果（不因序列掃描時市價微動而分歧）
+        const cycleCache: Record<string, BBResult> = { ...latestBBs };
+
         const updated: PositionRecord[] = [];
         for (const pos of this.positions) {
-            const precomputedBB = pos.poolAddress ? latestBBs[pos.poolAddress.toLowerCase()] : undefined;
-            const freshData = await this.scanPosition(pos.tokenId, pos.dex, precomputedBB);
+            const precomputedBB = pos.poolAddress ? cycleCache[pos.poolAddress.toLowerCase()] : undefined;
+            const freshData = await this.scanPosition(pos.tokenId, pos.dex, precomputedBB, pos.openTimestampMs, cycleCache);
             if (freshData) {
                 if (Number(freshData.liquidity) === 0) {
                     log.warn(`#${pos.tokenId} on-chain liquidity=0 — position may be closed`);
                 }
+                // Preserve the original ownerWallet if ownerOf returned a contract (e.g. gauge)
+                const isKnownWallet = config.WALLET_ADDRESSES.some(
+                    w => w.toLowerCase() === freshData.ownerWallet.toLowerCase()
+                );
+                if (!isKnownWallet) freshData.ownerWallet = pos.ownerWallet;
                 updated.push({ ...pos, ...freshData, lastUpdated: Date.now() });
             } else {
                 log.warn(`#${pos.tokenId} scan failed, keeping stale record`);
@@ -659,11 +1002,12 @@ export class PositionScanner {
         this.positions = updated;
 
         // Log snapshots to dedicated positions.log for historical audit
-        this.logPositionSnapshots(updated);
+        const firstBB = Object.values(cycleCache)[0] ?? null;
+        this.logPositionSnapshots(updated, firstBB);
 
         log.info(`✅ ${updated.length} position(s) refreshed`);
     }
 }
 
-// Re-export from OpenTimestampService so stateManager keeps a stable import path.
-export { getOpenTimestampSnapshot, restoreOpenTimestamps } from './OpenTimestampService';
+// Re-export from ChainEventScanner so stateManager keeps a stable import path.
+export { getOpenTimestampSnapshot, restoreOpenTimestamps } from './ChainEventScanner';
