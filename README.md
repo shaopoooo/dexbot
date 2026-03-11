@@ -408,6 +408,67 @@ Gas 費用由 `fetchGasCostUSD()` 即時取得（`maxFeePerGas × 300k gas × ET
 
 ---
 
+## Docker / Railway 部署
+
+`.env` 不進 repo 也不進 image：
+
+| 環境 | .env 來源 | 說明 |
+|------|-----------|------|
+| 本地 docker-compose | bind mount `.env` 進容器 | dotenvx 搭配 `DOTENV_PRIVATE_KEY` 解密 |
+| Railway | Dashboard 直接填明文 | Railway 自身加密儲存，無需 dotenvx |
+
+### 本地 docker-compose
+
+```bash
+# 1. 從 .env.keys 取得私鑰
+export DOTENV_PRIVATE_KEY="key_..."
+
+# 2. 第一次啟動 / 修改程式碼後（重新 build image）
+docker compose up -d --build
+
+# 只是重啟（未改程式碼）
+docker compose restart
+
+# 查看 log
+docker compose logs -f
+
+# 停止（保留 volume 資料）
+docker compose down
+```
+
+> `docker compose up -d` 不加 `--build` 會沿用舊 image，修改程式碼後務必加上 `--build`。
+
+### Railway 部署步驟
+
+1. **建立 Railway 專案**
+   Railway Dashboard → New Project → Deploy from GitHub repo（含 `Dockerfile`）
+
+2. **設定環境變數**
+   Railway Dashboard → Variables，逐一填入明文值（Railway 自行加密儲存）：
+
+   | 變數 | 說明 |
+   |------|------|
+   | `RPC_URL` | Base 主 RPC（QuickNode / Alchemy 付費節點） |
+   | `BOT_TOKEN` | Telegram Bot Token |
+   | `CHAT_ID` | Telegram Chat ID |
+   | `WALLET_ADDRESS_1` | 監控錢包地址（可加 `_2`, `_3`…） |
+   | `INITIAL_INVESTMENT_<tokenId>` | 各倉位初始本金 USD |
+   | `TRACKED_TOKEN_<tokenId>` | 手動追蹤鎖倉倉位，值為 DEX 名稱 |
+   | `PANCAKE_MASTERCHEF_V3` | PancakeSwap MasterChef V3 地址（選填） |
+
+3. **掛載 Volume（強烈建議）**
+   Railway Dashboard → 你的服務 → Volumes → Add Volume，路徑設為 `/app/data`
+
+   未掛載 Volume 時，每次重部署 `data/state.json` 會重置：
+   - PriceBuffer 冷啟動，BB stdDev 需 ~20 小時才回到正常帶寬
+   - volCache 重新請求 GeckoTerminal（可能觸發 429）
+   - openTimestamps 需重新掃描鏈上 Transfer 事件（~20–50 秒）
+
+4. **自動部署**
+   推送至 `main` 分支後，Railway 自動重新建置並部署。
+
+---
+
 ## 安全性備註
 
 本 Bot 為純背景監測腳本：

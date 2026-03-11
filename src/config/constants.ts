@@ -43,11 +43,15 @@ export const constants = {
     ONE_DAY_MS: 24 * 60 * 60 * 1000,
 
     // ── Block Scanning ────────────────────────────────────────────────────
-    BLOCK_SCAN_CHUNK: 2_000,
-    BLOCK_LOOKBACK: 25_000_000,
+    // 公共節點（publicnode / 1rpc）對複雜 topics filter 有 block range 限制，
+    // 500 blocks/chunk 可避免 -32002 timeout；付費節點可調高至 2000。
+    BLOCK_SCAN_CHUNK: 500,
+    // 25M → 3M（約 70 天）：stopOnFirstMatch 從新往舊掃，近期建倉幾乎立即命中；
+    // 超過 70 天的舊倉位開倉時間會顯示 N/A，建議手動設定 INITIAL_INVESTMENT_<tokenId>。
+    BLOCK_LOOKBACK: 3_000_000,
     BASE_BLOCK_TIME_MS: 2_000,
     COLLECTED_FEES_MAX_FAILURES: 3,   // 連續失敗上限，超過即中止本次掃描
-    COLLECTED_FEES_CHUNK_DELAY_MS: 100,
+    COLLECTED_FEES_CHUNK_DELAY_MS: 200,  // 500-block chunk 數量增加，delay 略拉長降低 rate-limit 風險
 
     // ── BB Engine Parameters ──────────────────────────────────────────────
     BB_K_LOW_VOL: 1.5,   // 震盪市 (vol < threshold)

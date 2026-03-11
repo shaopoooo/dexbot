@@ -359,5 +359,5 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 ### 🔵 階段七：架構整理與部署（待處理）
 
 - [ ] **整合共用型別**：`PoolStats`、`BBResult`、`PositionRecord`、`RiskAnalysis` 移至 `src/types/index.ts`
-- [ ] **新增 Dockerfile**：包含 Railway 部署指南
+- [x] **新增 Dockerfile**：multi-stage build（builder → runner）+ `.dockerignore`；README.md 新增 Railway 部署步驟（Volume 掛載、環境變數設定）
 

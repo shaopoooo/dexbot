@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "dotenvx run -f .env -- ts-node src/index.ts",
+    "start": "ts-node src/index.ts",
     "dev": "dotenvx run -f .env -- ts-node src/index.ts",
     "dryrun": "dotenvx run -f .env -- ts-node src/dryrun.ts",
     "test": "jest",
