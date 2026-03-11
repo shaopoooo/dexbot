@@ -21,9 +21,7 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 
-RUN mkdir -p data && chown -R node:node /app
-
-USER node
+RUN mkdir -p data
 
 # Railway: 環境變數由平台直接注入，無需 dotenvx
 # 本地 docker-compose: 覆寫為 dotenvx run -- node dist/index.js（見 docker-compose.yml）

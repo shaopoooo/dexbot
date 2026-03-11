@@ -346,18 +346,35 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 - [x] **State 恢復 positions**：重啟時若 wallet 配置未變，直接從 `state.json` 恢復 tokenId 清單，跳過 `syncFromChain`（省 20-50s）
 - [x] **DexScreener 價格快取**：BBEngine 的 WETH/cbBTC 價格快取 2 分鐘，同週期只打一次 API
 
-### 🟡 階段六：計算精度、優化與測試（待處理）
+### 🔴 階段六：穩定性補強（待處理）
 
+- [ ] **SIGTERM 優雅關機**：`index.ts` 加入 `process.on('SIGTERM')` handler，Railway redeploy 前呼叫 `saveState()` 確保 `state.json` 在容器被殺前寫入
+- [ ] **PriceBuffer 冷啟動缺口**：重啟後「當前小時價格」可能遺失 1-2 筆，BBEngine 在冷啟動後第 1 小時內可能使用 fallback（±10% 固定區間）；需於 `saveState` / `restoreState` 確保當前小時 entry 完整保存，並在 restore 後補一次 `addPrice(currentPrice)` 強制更新
+- [ ] **GeckoTerminal 全局 rate limiter**：目前 retry + jitter 屬於單一請求層級；同時掃多池 + BBEngine backfill 時仍易觸發 429；改用 `p-limit`（並發上限 2）統一管控所有 GeckoTerminal 呼叫
+- [ ] **DexScreener 呼叫補 timeout**：`PoolScanner.ts` 的 `axios.get(dexscreener)` 缺少 `{ timeout }` 設定，無回應時整個 PoolScanner 永遠卡住
+- [ ] **Telegram 錯誤通知**：Bot 遇到嚴重錯誤（RPC 全掛、所有倉位掃描失敗）時主動推播告警，避免用戶不知道 Bot 已停止運作
+- [ ] **環境變數驗證**：`env.ts` 目前只讀取，未檢查必填欄位（`BOT_TOKEN`、`CHAT_ID`）；啟動時應驗證並在缺少時 `process.exit(1)` 並輸出清楚錯誤訊息
+
+### 🟡 階段七：計算精度、優化與測試（待處理）
+
+- [ ] **完整 IL 即時計算**：`RiskManager` / `PnlCalculator` 目前使用簡化公式；改用 `@uniswap/v3-sdk` 的 `Position` 算精準 `tokensOwed + IL`，與 SDK 保持一致
 - [ ] **重構 PnlCalculator & RiskManager**：與 `@uniswap/v3-sdk` 原生數學對齊
-- [ ] **擴充 Jest 測試**：動態 Gas 閾值、零 TVL、極端 Tick、最大波動率等邊界情境
-- [ ] **PoolScanner 平行化**：`scanAllCorePools` 目前 5 個池子串行（~30s），改為 `Promise.all` 平行掃描
-  - ⚠️ **注意 GeckoTerminal rate-limit**：`fetchPoolVolume` 用 GeckoTerminal 免費 API，429 很常見
-  - 平行化前須確認：`poolVolCache`（30 分鐘 TTL）已命中時不發請求；第一次 cold-start 建議限制並發數（最多 2-3 個同時），或加入 Exponential Backoff + Jitter
-  - slot0 RPC 呼叫已有 `nextProvider()` 輪換，平行化安全
-  - `fetchPoolStats` 內的 DexScreener 呼叫（不同 URL per pool）可安全平行
+- [ ] **avg30DBandwidth 修正**：`index.ts` 的 `previousBandwidths` 實際只記錄「上一個 5 分鐘週期」帶寬，非真正 30D 均值；改為滾動窗口（保留最近 8640 筆 = 30D × 288 次/天）計算均值，使 `HIGH_VOLATILITY_AVOID` 觸發條件有意義
+- [ ] **PoolScanner 平行化**：`scanAllCorePools` 目前 5 個池子串行（~30s），改為 `Promise.allSettled` 平行掃描（預估降至 ~2s）
+  - ⚠️ **注意 GeckoTerminal rate-limit**：須搭配全局 rate limiter（階段六），cold-start 並發上限 ≤ 2
+  - slot0 RPC（`nextProvider()` 輪換）與 DexScreener（不同 URL）可安全平行
+- [ ] **GeckoTerminal URL 統一**：`PoolScanner.ts:91` 硬編碼 URL，應改用 `config.API_URLS.GECKOTERMINAL_OHLCV` 與 BBEngine 保持一致
+- [ ] **`latestBBs` / `latestRisks` 清理**：倉位 liquidity=0（已關閉）後對應條目應從 Map 移除，避免長時間執行的記憶體洩漏
+- [ ] **擴充 Jest 測試**：補齊 `tests/` 目錄覆蓋率（目前幾乎空白）；動態 Gas 閾值、零 TVL、極端 Tick、最大波動率等邊界情境
+- [ ] **Rebalance Gas 即時化**：`rebalance.ts` 的 `estGasCost` 目前硬編碼 `config.REBALANCE_GAS_COST_USD`（$0.1）；改為接收 `gasCostUSD` 參數（由 `fetchGasCostUSD()` 提供），並加入「本次 rebalance 是否划算（`unclaimedFeesUSD > gasCost × 2`）」前置判斷，不划算時降級為 `wait` 策略
+- [ ] **BBEngine 方向性偏移（SD offset）**：`rebalance.ts` 單邊建倉目前以 SMA 為中心對稱建議；加入市場方向判斷（`currentPrice vs sma` 的偏差方向），ETH 弱勢（`currentPrice < sma`）時將建議區間中心下移 0.3 SD，強勢時上移，讓單邊建倉更貼近均值回歸路徑
+- [ ] **回測策略模擬**：`BacktestEngine.ts` 目前只做靜態 BB 計算；新增 simulation loop，將 `rebalance.ts` 的策略決策套用至 GeckoTerminal 30 天歷史 OHLCV，輸出「動 vs 不動」的 IL / Fee / 淨報酬比較，協助判斷每次超出是否值得再平衡
 
-### 🔵 階段七：架構整理與部署（待處理）
+### 🔵 階段八：架構整理與維運（待處理）
 
 - [ ] **整合共用型別**：`PoolStats`、`BBResult`、`PositionRecord`、`RiskAnalysis` 移至 `src/types/index.ts`
 - [x] **新增 Dockerfile**：multi-stage build（builder → runner）+ `.dockerignore`；README.md 新增 Railway 部署步驟（Volume 掛載、環境變數設定）
+- [ ] **README 常見問題章節**：新增「常見錯誤排除」與「如何看 log」說明，降低部署門檻
+- [ ] **Docker Compose healthcheck**：`docker-compose.yml` 加入 `healthcheck`，讓 Docker 能偵測容器是否卡死
+- [ ] **GitHub Actions CI**：push / PR 時自動跑 `tsc --noEmit` + `jest`，防止帶有型別錯誤的程式碼合入
 
