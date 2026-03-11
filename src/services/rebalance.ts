@@ -86,7 +86,7 @@ export class RebalanceService {
             } else if (currentPrice < currentBB.minPriceRatio) {
                 driftPercent = ((currentBB.minPriceRatio - currentPrice) / currentBB.minPriceRatio) * 100 * -1; // 負值表示下超出
             }
-            if (Math.abs(driftPercent) < 5) return null; // <5% 不觸發
+            if (Math.abs(driftPercent) < config.REBALANCE_DRIFT_MIN_PCT) return null;
 
             // 步驟 2: 產生新 BB 區間 (不需要重複跑 BBEngine，因為 currentBB 已經包含了基於當前 tick/時間算出的最新點位建議)
             const newBB = currentBB;
@@ -98,11 +98,11 @@ export class RebalanceService {
 
             const threshold = config.EOQ_THRESHOLD; // 你的 EOQ Threshold
 
-            if (Math.abs(driftPercent) < 10 && breakevenDays < 15) {
+            if (Math.abs(driftPercent) < config.REBALANCE_WAIT_DRIFT_PCT && breakevenDays < config.REBALANCE_WAIT_BREAKEVEN_DAYS) {
                 recommendedStrategy = 'wait';
                 strategyName = '等待回歸';
                 notes = '超出小，等待價格回歸（零成本，IL 無鎖定）';
-            } else if (Math.abs(driftPercent) < 20 && unclaimedFeesUSD > threshold) {
+            } else if (Math.abs(driftPercent) < config.REBALANCE_DCA_DRIFT_PCT && unclaimedFeesUSD > threshold) {
                 recommendedStrategy = 'dca';
                 strategyName = 'DCA 定投平衡';
                 // 為了完美補齊倉位，我們需要精算 BBEngine 建議的新區間 (newBB) 實際上需要多少的 Token0/Token1 比例
@@ -139,7 +139,7 @@ export class RebalanceService {
                     singleSideMax = newBB.sma;
                     // 必須嚴格保證上限低於市價，否則立刻需要另一邊代幣
                     if (singleSideMax >= currentPrice) {
-                        singleSideMax = currentPrice * 0.9999;
+                        singleSideMax = currentPrice * config.REBALANCE_PRICE_UPPER_MARGIN;
                     }
                 } else {
                     // 價格跌過頭 (向下飄移)，我們手上 100% 都是 Token0 (Base，通常為 cbBTC 等)
@@ -149,7 +149,7 @@ export class RebalanceService {
                     singleSideMax = newBB.maxPriceRatio;
                     // 必須嚴格保證下限高於市價
                     if (singleSideMin <= currentPrice) {
-                        singleSideMin = currentPrice * 1.0001;
+                        singleSideMin = currentPrice * config.REBALANCE_PRICE_LOWER_MARGIN;
                     }
                 }
 
@@ -166,8 +166,7 @@ export class RebalanceService {
             // 永遠避免直接兌換
             notes += '。注意：不建議直接 ETH 換 BTC（低賣高買，IL 高）';
 
-            // 估 Gas (Base 單次 rebalance ≈ $0.1)
-            const estGasCost = recommendedStrategy === 'withdrawSingleSide' ? 0.1 : 0;
+            const estGasCost = recommendedStrategy === 'withdrawSingleSide' ? config.REBALANCE_GAS_COST_USD : 0;
 
             return {
                 newMinPrice: newBB.minPriceRatio,

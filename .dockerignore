@@ -1,0 +1,11 @@
+node_modules
+dist
+data
+.env
+.env.*
+*.log
+logs
+.DS_Store
+.git
+.gitignore
+CLAUDE.md

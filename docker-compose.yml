@@ -1,0 +1,15 @@
+services:
+  dexbot:
+    build: .
+    restart: unless-stopped
+    # dotenvx 解密本機加密 .env
+    # 啟動前設定私鑰：export DOTENV_PRIVATE_KEY="key_..."
+    command: ["./node_modules/.bin/dotenvx", "run", "--", "node", "dist/index.js"]
+    environment:
+      - DOTENV_PRIVATE_KEY=${DOTENV_PRIVATE_KEY}
+    volumes:
+      - ./.env:/app/.env:ro   # 執行時 bind mount，不進 image
+      - dexbot-data:/app/data  # 持久化 state.json
+
+volumes:
+  dexbot-data:

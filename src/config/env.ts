@@ -1,6 +1,3 @@
-import * as dotenv from 'dotenv';
-dotenv.config();
-
 export const env = {
     RPC_URL: process.env.RPC_URL || 'https://mainnet.base.org',
     WALLET_ADDRESSES: (() => {

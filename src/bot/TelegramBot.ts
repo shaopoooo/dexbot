@@ -9,13 +9,29 @@ import { PnlCalculator } from '../services/PnlCalculator';
 
 const log = createServiceLogger('TelegramBot');
 
+/** 將極小數字格式化為緊湊表示法：小數點後 ≥2 個零時使用下標 */
+function compactAmount(n: number): string {
+    if (n <= 0) return '0';
+    const s = n.toFixed(20);
+    const dec = s.split('.')[1] || '';
+    let zeros = 0;
+    for (const c of dec) { if (c === '0') zeros++; else break; }
+    if (zeros >= 2) {
+        const sig = dec.slice(zeros, zeros + 4).replace(/0+$/, '');
+        const sub = '₀₁₂₃₄₅₆₇₈₉';
+        const subscript = String(zeros).split('').map(d => sub[+d]).join('');
+        return `0.0${subscript}${sig}`;
+    }
+    return n.toFixed(zeros + 4).replace(/\.?0+$/, '');
+}
+
 type SortBy = 'size' | 'apr' | 'unclaimed' | 'health';
 
 const SORT_LABELS: Record<SortBy, string> = {
-    size:      '倉位大小',
-    apr:       'APR',
+    size: '倉位大小',
+    apr: 'APR',
     unclaimed: 'Unclaimed',
-    health:    'Health Score',
+    health: 'Health Score',
 };
 
 export class TelegramBotService {
@@ -53,9 +69,13 @@ export class TelegramBotService {
                 `<b>健康分數</b> (0–100)\n` +
                 `= 50 + (Unclaimed + IL) / 本金 × 1000\n` +
                 `50 = 損益兩平，100 = 盈利 ≥5%\n\n` +
-                `<b>IL（絕對 PNL）</b>\n` +
-                `= LP現值 + 累計手續費 - 初始本金\n` +
-                `正值 🟢 = 盈利，負值 🔴 = 虧損\n\n` +
+                `<b>淨損益（PnL）</b>\n` +
+                `= LP現值 + Unclaimed - 初始本金\n` +
+                `正值 🟢 = 盈利，負值 🔴 = 虧損\n` +
+                `（已領取再投入的費用已含於LP現值，不重複計算）\n\n` +
+                `<b>無常損失（IL）</b>\n` +
+                `= LP現值 - 初始本金\n` +
+                `純市價波動造成的 LP 倉位變化，不含手續費\n\n` +
                 `<b>Breakeven 天數</b>\n` +
                 `= |IL| / 每日手續費收入\n` +
                 `代表需幾天費用彌補目前 IL\n\n` +
@@ -110,7 +130,7 @@ export class TelegramBotService {
         risk: RiskAnalysis
     ): string {
         const label = `${pool.dex} ${(pool.feeTier * 100).toFixed(4).replace(/\.?0+$/, '')}%`;
-        const walletShort = position.ownerWallet
+        const walletShort = position.ownerWallet && /^0x[0-9a-fA-F]{40}$/.test(position.ownerWallet)
             ? `${position.ownerWallet.slice(0, 6)}...${position.ownerWallet.slice(-4)}`
             : '未知';
         const posValue = position.positionValueUSD > 0
@@ -118,42 +138,66 @@ export class TelegramBotService {
             : 'N/A';
         const initialCapital = PnlCalculator.getInitialCapital(position.tokenId);
         const capitalStr = initialCapital !== null ? `$${initialCapital.toFixed(0)}` : 'N/A';
-        const ilDisplay = position.ilUSD === null
-            ? '未設定'
+
+        // 淨損益 = LP現值 + Unclaimed - 本金（含手續費貢獻）
+        const pnlDisplay = position.ilUSD === null
+            ? '未設定本金'
             : position.ilUSD >= 0
                 ? `+$${position.ilUSD.toFixed(1)} 🟢`
                 : `-$${Math.abs(position.ilUSD).toFixed(1)} 🔴`;
+
+        // 無常損失 = LP現值 - 本金（純市價波動，不含手續費）
+        const ilOnly = initialCapital !== null ? position.positionValueUSD - initialCapital : null;
+        const ilOnlyDisplay = ilOnly === null
+            ? ''
+            : ilOnly >= 0
+                ? `+$${ilOnly.toFixed(1)} 🟢`
+                : `-$${Math.abs(ilOnly).toFixed(1)} 🔴`;
+
         const bbBound = (bb && position.bbMinPrice && position.bbMaxPrice)
             ? `${position.bbMinPrice} ~ ${position.bbMaxPrice}${position.bbFallback ? ' ⚠️' : ''}`
             : '無數據';
         const cmp = risk.compoundSignal ? '✅' : '❌';
 
-        // 開倉時間 + 獲利率（由 PnlCalculator 計算）
         const openInfo = PnlCalculator.calculateOpenInfo(position.tokenId, position.openTimestampMs, position.ilUSD);
-        let openInfoRow = '';
-        if (openInfo) {
-            if (openInfo.profitRate !== null) {
-                const sign = openInfo.profitRate >= 0 ? '+' : '';
-                openInfoRow = `⏳ 開倉 ${openInfo.timeStr} · 獲利 <b>${sign}${openInfo.profitRate.toFixed(2)}%</b>\n`;
-            } else {
-                openInfoRow = `⏳ 開倉 ${openInfo.timeStr}\n`;
-            }
-        }
+        const profitStr = (openInfo?.profitRate !== null && openInfo?.profitRate !== undefined)
+            ? ` · 獲利 <b>${openInfo.profitRate >= 0 ? '+' : ''}${openInfo.profitRate.toFixed(2)}%</b>`
+            : '';
+        const breakevenStr = (position.ilUSD !== null && position.ilUSD >= 0) ? '盈利中' : `${risk.ilBreakevenDays}天`;
 
+        // ── 標頭
         let block = `\n━━ #${index} ${label} ━━\n`;
-        block += `倉位 ${posValue} | 本金 ${capitalStr} | 健康 ${risk.healthScore}/100\n`;
-        if (openInfoRow) block += openInfoRow;
-        block += `👛 ${walletShort} · #${position.tokenId}\n`;
+        // ── 錢包（第二行）
+        const lockIcon = position.isStaked ? ' 🔒' : '';
+        block += `👛 ${walletShort} · #${position.tokenId}${lockIcon}\n`;
+        // ── 開倉時間
+        if (openInfo) block += `⏳ 開倉 ${openInfo.timeStr}\n`;
+        // ── 價格 + 區間（縮排）
         block += `💹 當前 ${position.currentPriceStr} | ${position.regime}\n`;
-        block += `  ├ 你的 ${position.minPrice} ~ ${position.maxPrice}\n`;
-        block += `  └ BB   ${bbBound}\n`;
-        block += `💸 Unclaimed $${position.unclaimedFeesUSD.toFixed(1)} | IL ${ilDisplay}\n`;
-        const breakevenStr = (position.ilUSD !== null && position.ilUSD >= 0)
-            ? '盈利中'
-            : `${risk.ilBreakevenDays}天`;
-        block += `⏱ Breakeven ${breakevenStr}\n`;
-        block += `🔄 Compound ${cmp} $${position.unclaimedFeesUSD.toFixed(1)} ${risk.compoundSignal ? '&gt;' : '&lt;'} $${risk.compoundThreshold.toFixed(1)}\n`;
-
+        block += ` ├ 你的 ${position.minPrice} ~ ${position.maxPrice}\n`;
+        block += ` └ 建議 ${bbBound}\n`;
+        // ── 倉位摘要（縮排）
+        block += `💼 倉位 ${posValue} | 本金 ${capitalStr} | 健康 ${risk.healthScore}/100\n`;
+        // ── Breakeven + 獲利率同行
+        block += `⌛  Breakeven ${breakevenStr}${profitStr}\n`;
+        // ── 淨損益 + 無常損失
+        block += `💸 淨損益 ${pnlDisplay}`;
+        if (ilOnlyDisplay) block += ` | 無常損失 ${ilOnlyDisplay}`;
+        block += '\n';
+        // ── 建議領取：未領取手續費 + 逐幣明細
+        const dec0 = position.token0Symbol === 'cbBTC' ? 8 : 18;
+        const dec1 = position.token1Symbol === 'cbBTC' ? 8 : 18;
+        const amt0 = Number(BigInt(position.unclaimed0 || '0')) / Math.pow(10, dec0);
+        const amt1 = Number(BigInt(position.unclaimed1 || '0')) / Math.pow(10, dec1);
+        const amt2 = Number(BigInt(position.unclaimed2 || '0')) / 1e18;
+        const feeDetail = [
+            amt0 > 0 ? `${compactAmount(amt0)} ${position.token0Symbol} ($${position.fees0USD.toFixed(2)})` : '',
+            amt1 > 0 ? `${compactAmount(amt1)} ${position.token1Symbol} ($${position.fees1USD.toFixed(2)})` : '',
+            amt2 > 0 && position.token2Symbol ? `${compactAmount(amt2)} ${position.token2Symbol} ($${position.fees2USD.toFixed(2)})` : '',
+        ].filter(Boolean);
+        block += `🔄 未領取手續費 $${position.unclaimedFeesUSD.toFixed(2)} ${cmp} ${risk.compoundSignal ? '&gt;' : '&lt;'} $${risk.compoundThreshold.toFixed(1)}\n`;
+        for (const line of feeDetail) block += `     ${line}\n`;
+        // ── 警示
         if (risk.redAlert) block += `🚨 <b>RED_ALERT</b>: Breakeven &gt;${RiskManager.RED_ALERT_BREAKEVEN_DAYS}天 (建議減倉)\n`;
         if (risk.highVolatilityAvoid) block += `⚠️ <b>HIGH_VOLATILITY_AVOID</b> (建議觀望)\n`;
         if (risk.driftWarning) {
@@ -188,11 +232,11 @@ export class TelegramBotService {
         // 依當前排序鍵由大到小排列
         const sorted = [...entries].sort((a, b) => {
             switch (this.sortBy) {
-                case 'apr':       return b.pool.apr - a.pool.apr;
+                case 'apr': return b.pool.apr - a.pool.apr;
                 case 'unclaimed': return b.position.unclaimedFeesUSD - a.position.unclaimedFeesUSD;
-                case 'health':    return b.risk.healthScore - a.risk.healthScore;
+                case 'health': return b.risk.healthScore - a.risk.healthScore;
                 case 'size':
-                default:          return b.position.positionValueUSD - a.position.positionValueUSD;
+                default: return b.position.positionValueUSD - a.position.positionValueUSD;
             }
         });
 
@@ -203,6 +247,14 @@ export class TelegramBotService {
         let msg = `<b>[${timeStr}] 倉位監控報告 (${sorted.length} 個倉位 | 排序: ${SORT_LABELS[this.sortBy]} ↓)</b>`;
         msg += `\n\n📊 <b>總覽</b>  ${summary.positionCount} 倉位 · ${summary.walletCount} 錢包`;
         msg += `\n💼 總倉位 <b>$${summary.totalPositionUSD.toFixed(0)}</b>  |  本金 <b>$${summary.totalInitialCapital.toFixed(0)}</b>  |  Unclaimed <b>$${summary.totalUnclaimedUSD.toFixed(1)}</b>`;
+
+        // 即時幣價
+        const bb0 = entries.find(e => e.bb)?.bb;
+        if (bb0) {
+            const p = (v: number, d: number) => v > 0 ? `$${v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}` : '–';
+            msg += `\n💱 ETH ${p(bb0.ethPrice, 0)}  BTC ${p(bb0.cbbtcPrice, 0)}  CAKE ${p(bb0.cakePrice, 3)}  AERO ${p(bb0.aeroPrice, 3)}`;
+        }
+
         if (summary.totalPnL !== null) {
             const icon = summary.totalPnL >= 0 ? '🟢' : '🔴';
             const pctStr = summary.totalPnLPct !== null
@@ -231,7 +283,7 @@ export class TelegramBotService {
         }
 
         // 更新時間（顯示一次）
-        msg += `\n\n⏱ <b>資料更新時間:</b>`;
+        msg += `\n\n⌛ <b>資料更新時間:</b>`;
         msg += `\n- Pool: ${formatTs(lastUpdates.poolScanner)} | Position: ${formatTs(lastUpdates.positionScanner)}`;
         msg += `\n- BB Engine: ${formatTs(lastUpdates.bbEngine)} | Risk: ${formatTs(lastUpdates.riskManager)}`;
 

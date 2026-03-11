@@ -69,16 +69,16 @@ src/
 ├── index.ts                    # 主進入點：cron 排程、服務協調、狀態存取
 ├── config/
 │   ├── env.ts                  # 環境變數讀取（process.env）
-│   ├── constants.ts            # 常數（池地址、子圖端點、快取 TTL）
+│   ├── constants.ts            # 常數（池地址、快取 TTL、BB 參數、EWMA、區塊掃描、Gas）
 │   ├── abis.ts                 # 合約 ABI（NPM、Pool、Aero Voter/Gauge）
 │   └── index.ts                # 統一匯出入口
 ├── services/
-│   ├── PoolScanner.ts          # APR 掃描（DexScreener + The Graph + GeckoTerminal）
-│   ├── BBEngine.ts             # 動態布林通道（20 SMA + 30D 波動率）
+│   ├── PoolScanner.ts          # APR 掃描（DexScreener + GeckoTerminal）
+│   ├── BBEngine.ts             # 動態布林通道（20 SMA + EWMA stdDev + 30D 波動率）
+│   ├── ChainEventScanner.ts    # 通用鏈上事件掃描器（ScanHandler 介面 + OpenTimestampHandler）
 │   ├── PositionScanner.ts      # LP NFT 倉位監測（On-chain RPC）
 │   ├── RiskManager.ts          # 風險評估（Health Score、IL Breakeven、EOQ 複利訊號）
 │   ├── PnlCalculator.ts        # 絕對 PNL、開倉資訊、組合總覽計算
-│   ├── OpenTimestampService.ts # 批次查詢 NFT 建倉時間戳（per NPM 單次 getLogs）
 │   └── rebalance.ts            # 再平衡建議（純計算，不執行交易）
 ├── bot/
 │   └── TelegramBot.ts          # Telegram 推播格式化
@@ -106,7 +106,7 @@ runPoolScanner → runBBEngine → runPositionScanner → runRiskManager → run
 
 ### PoolScanner（`src/services/PoolScanner.ts`）
 
-- **資料來源**：DexScreener（TVL）→ The Graph（Uniswap/PancakeSwap）→ GeckoTerminal（Aerodrome + fallback）
+- **資料來源**：DexScreener（TVL）→ GeckoTerminal（所有池子，The Graph subgraph 已停用）
 - **APR 公式**：`APR = (24h 手續費 / TVL) × 365`，24h 手續費 = 7D 加權均量 × 費率
 - **關鍵函式**：`scanAllCorePools()` → `fetchPoolStats()` → `fetchPoolVolume()`
 
@@ -120,24 +120,38 @@ runPoolScanner → runBBEngine → runPositionScanner → runRiskManager → run
 
 ### BBEngine（`src/services/BBEngine.ts`）
 
-- **均線週期**：20 SMA，時間框架：1 小時；Tick 轉換使用 `@uniswap/v3-sdk` `TickMath` + `nearestUsableTick`
-- **下界保護**：`lowerPrice = max(sma - maxOffset, sma - k × stdDev)`，禁止使用絕對數值夾值
+- **均線週期**：20 SMA（`BB_HOURLY_WINDOW=20`），時間框架：1 小時；Tick 轉換使用 `nearestUsableTick`
+- **stdDev 計算**：資料 ≥ 5 筆（`MIN_CANDLES_FOR_EWMA`）時用 EWMA（`α=0.3, β=0.7`）平滑後計算；不足時從 30D 年化波動率換算 1H stdDev（`sma × vol / √8760`）
+- **Tick 計算方式**：直接由 SMA price 換算 tick（`tick = log(price) / log(1.0001)`），不再以 currentTick ± offset 計算；同一池子所有倉位週期內看到相同 BB，不受市價微動影響
+- **下界保護**：`lowerPrice = max(sma - maxOffset, sma - k × stdDev)`，`maxOffset = sma × 10%`，禁止使用絕對數值夾值
+- **幣價快取**：同時取得 WETH / cbBTC / CAKE / AERO 四個價格（DexScreener，2 分鐘 TTL），存入 `BBResult`
 - **關鍵函式**：`computeDynamicBB()` — 計算上下界 Tick 與價格
 
 | 市場狀態 | 條件 | k 值 |
 |----------|------|------|
-| 震盪市 | 30D 年化波動率 < 50% | `k = 1.2` |
-| 趨勢市 | 30D 年化波動率 ≥ 50% | `k = 1.8` |
+| 震盪市 | 30D 年化波動率 < 50% | `k = 1.5` |
+| 趨勢市 | 30D 年化波動率 ≥ 50% | `k = 2.0` |
+
+### ChainEventScanner（`src/services/ChainEventScanner.ts`）
+
+- **架構**：通用 `getLogs` 掃描器，取代 `OpenTimestampService.ts`；新增事件類型只需實作 `ScanHandler` 介面並呼叫 `chainEventScanner.registerHandler()`
+- **ScanHandler 介面**：`getFromBlock()` / `processLog()` / `onBatchComplete()`；支援 `stopOnFirstMatch`、`needsBlockTimestamp`、OR-filter tokenId 批次查詢
+- **分組策略**：同 NPM 合約的所有 tokenId 合併一次 `getLogs`（OR filter），分塊掃描（`BLOCK_SCAN_CHUNK=2000`），連續失敗超過 `MAX_CONSECUTIVE_FAILURES=3` 即中止
+- **內建 Handler**：`OpenTimestampHandler`（原 `OpenTimestampService.ts` 邏輯移入此處）
+- **Singleton 匯出**：`chainEventScanner`、`openTimestampHandler`、`getOpenTimestampSnapshot()`、`restoreOpenTimestamps()`
 
 ### PositionScanner（`src/services/PositionScanner.ts`）
 
 - **多錢包支援**：`WALLET_ADDRESS_1`、`WALLET_ADDRESS_2`... 環境變數，支援動態新增
-- **Gauge 鎖倉**：`TRACKED_TOKEN_<tokenId>=<DEX>` 手動追蹤質押至 Aerodrome Gauge 的倉位
+- **Gauge 鎖倉**：`TRACKED_TOKEN_<tokenId>=<DEX>` 手動追蹤質押倉位；`isStaked` 欄位自動偵測（ownerOf 回傳非已知錢包 → staked）；`depositorWallet` 追蹤實際持有者
 - **Drift 門檻**：實際區間與 BB 區間重合度 < 80% 時推播 `STRATEGY_DRIFT_WARNING`
+- **第三幣獎勵**：`unclaimed2` / `fees2USD` / `token2Symbol` 追蹤 CAKE（PancakeSwap MasterChef V3 `pendingCake()`）與 AERO（Aerodrome gauge `earned()`）
 - **手續費計算策略**：
-  - Aerodrome → `fetchAerodromeGaugeFees()`（voter → gauge → `pendingFees` 或 `collect.staticCall`）
+  - Aerodrome staked → canonical `voter.gauges()` → `gauge.pendingFees(tokenId)` → `collect.staticCall({from: gauge})` → `tokensOwed` fallback
+  - Aerodrome unstaked → `computePendingFees()`（pool feeGrowth 數學計算）
   - Uniswap / PancakeSwap → `collect.staticCall({ from: owner })`
   - 最終 fallback：NPM `positions()` 的 `tokensOwed0/1`
+- **cycleCache**：`updateAllPositions` 共用 BB 快取，同一池子的多個倉位取得完全相同 BB（不因序列掃描時市價微動而分歧）
 - **注意**：Aerodrome `positions()` 第 5 欄回傳 `tickSpacing`（非 fee pips）
 - **關鍵函式**：`updateAllPositions()` / `syncFromChain()` / `restoreDiscoveredPositions()` / `getDiscoveredSnapshot()`
 
@@ -166,28 +180,51 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 ### Telegram Bot（`src/bot/TelegramBot.ts`）
 
 - **關鍵函式**：`sendConsolidatedReport()` — 每 5 分鐘推播單一合併報告
+- **`compactAmount(n)`**：將極小數字轉為下標零表示法（如 `0.0002719` → `0.0₃2719`），Telegram 與 positions.log 共用同一邏輯
+- **淨損益 vs 無常損失**：`💸 淨損益` = LP現值 + Unclaimed - 本金（含手續費）；`無常損失` = LP現值 - 本金（純市價波動）
+- **鎖倉 icon**：`isStaked = true` 的倉位在 tokenId 後顯示 `🔒`
 
 ```
 [2026-03-07 10:00] 倉位監控報告 (2 個倉位 | 排序: 倉位大小 ↓)
 
 📊 總覽  2 倉位 · 2 錢包
-💼 總倉位 $2,960  |  Unclaimed $4.6
-💰 總獲利 +$18.2 (+1.82%) 🟢
+💼 總倉位 $20,200  |  本金 $18,000  |  Unclaimed $6.7
+💱 ETH $2,053  BTC $70,387  CAKE $1.380  AERO $0.324
+💰 總獲利 +$276.8 (+1.38%) 🟢
 
 ━━ #1 PancakeSwap 0.01% ━━
-倉位 $1,987 | 本金 $2,000 | 健康 94/100
-⏳ 開倉 3天2小時 · 獲利 +1.82%
 👛 0xabc...1234 · #1675918
+⏳ 開倉 3天2小時
 💹 當前 0.02921 | Low Vol (震盪市)
-  ├ 你的 0.02803 ~ 0.03054
-  └ BB   0.02628 ~ 0.03213
-💸 Unclaimed $4.6 | IL +$18.2 🟢
-⏱ Breakeven 盈利中
-🔄 Compound ✅ $4.6 > $0.1
+ ├ 你的 0.02803 ~ 0.03054
+ └ 建議 0.02628 ~ 0.03213
+💼 倉位 $1,987 | 本金 $2,000 | 健康 94/100
+⌛  Breakeven 盈利中 · 獲利 +1.82%
+💸 淨損益 +$18.2 🟢 | 無常損失 -$13.0 🔴
+🔄 未領取手續費 $4.62 ✅ > $0.1
+     0.0₃2719 WETH ($0.56)
+     0.0₅774 cbBTC ($0.54)
+
+━━ #2 Aerodrome 0.0085% ━━
+👛 0xdef...5678 · #56328282 🔒
+⏳ 開倉 1天0小時
+💹 當前 0.02905 | High Vol (趨勢市)
+ ├ 你的 0.02700 ~ 0.03100
+ └ 建議 0.02550 ~ 0.03300
+💼 倉位 $7,800 | 本金 $8,000 | 健康 61/100
+⌛  Breakeven 22天
+💸 淨損益 -$95.0 🔴
+🔄 未領取手續費 $2.10 ❌ < $5.8
+⚠️ DRIFT 重疊 71.3% (建議依 BB 重建倉)
 
 📊 各池收益排行:
-🥇 Aerodrome 0.0085% — APR 67.2% | TVL $1,234K
-🥈 PancakeSwap 0.01% — APR 29.4% | TVL $987K ◀ 你的倉位
+🥇 PancakeSwap 0.01% — APR 67.2% | TVL $1,234K ◀ 你的倉位
+🥈 Aerodrome 0.0085% — APR 29.4% | TVL $987K ◀ 你的倉位
+🥉 Uniswap 0.05% — APR 18.6% | TVL $543K
+
+⌛ 資料更新時間:
+- Pool: 10:00 | Position: 10:00
+- BB Engine: 10:00 | Risk: 10:00
 ```
 
 排序指令：`/sort size`、`/sort apr`、`/sort unclaimed`、`/sort health`
@@ -206,11 +243,7 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 
 ### 待處理問題定位
 
-| 問題 | 檔案 | 位置 |
-|------|------|------|
-| 缺少 User-Agent Header | `src/services/PoolScanner.ts` | `fetchPoolVolume()` |
-| 缺少 User-Agent Header | `src/services/BBEngine.ts` | `fetchDailyVol()` |
-| GeckoTerminal 429 rate-limit（平行化前必須處理） | `src/services/PoolScanner.ts` | `fetchPoolVolume()` — 免費 API 易觸發 429，需限制並發（≤2）+ Exponential Backoff |
+目前已知待處理項目：GeckoTerminal 免費 API 易觸發 429，平行化前須確認快取命中率並加入 Exponential Backoff + Jitter（詳見階段六任務清單）。
 
 ---
 
@@ -234,7 +267,7 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 - [x] **config 拆分**：`env.ts` / `constants.ts` / `abis.ts` 分離，`index.ts` 統一匯出
 - [x] **README.md**：完整記錄環境變數、架構與啟動方式
 
-### ✅ 階段二：多池子 & 多錢包支援（已完成）
+### ✅ 階段二：多 DEX / 多錢包支援（已完成）
 
 - [x] **新增 Aerodrome WETH/cbBTC 池**：fee=85 (0.0085%)，tickSpacing=1，NPM `0x827922...`
 - [x] **池命名統一**：全部改為 `{DEX}_{交易對}_{費率}` 格式（如 `UNISWAP_WETH_CBBTC_0_05`）
@@ -269,49 +302,6 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 - [x] **手機排版優化**：`formatPositionBlock` 改為每行 ≤ 40 字元，分組顯示
 - [x] **/explain 指令**：發送完整指標計算公式說明
 - [x] **建倉時間戳**：`syncFromChain` 自動查詢 NFT mint Transfer 事件，快取於 in-memory
-
-### ✅ 階段五：系統穩定性（已完成）
-
-- [x] **狀態持久化**：`PriceBuffer`、`volCache`、`openTimestampCache`、Bot 排序偏好 存入 `data/state.json`（`src/utils/stateManager.ts`）
-- [x] **記憶體管理**：`volCache` 集中至 `src/utils/cache.ts`，改用 `lru-cache`（max: 100）
-- [ ] **API 防封鎖**：GeckoTerminal 請求補上 `User-Agent` Header（跳過）
-- [x] **動態 Gas Oracle**：`src/utils/rpcProvider.ts` 新增 `fetchGasCostUSD()`，即時取得 `maxFeePerGas × GAS_UNITS × ETH_PRICE`，5 分鐘快取；`RiskManager.analyzePosition()` 接受 `gasCostUSD?` 參數
-- [x] **Pool Address 輸入校驗**：`PoolScanner.fetchPoolStats()` 加入 `/^0x[0-9a-fA-F]{40}$/` 驗證
-- [x] **rpcRetry 補強**：除 rate-limit 外，新增對 `SERVER_ERROR`（502/503）的重試邏輯，避免公共節點瞬斷直接失敗
-- [x] **OpenTimestampService**：`src/services/OpenTimestampService.ts`，以 NPM 合約為單位批次掃描 Transfer 事件，所有 tokenId 合併成一次 `getLogs`（`topics[3]` OR filter），不再每個 tokenId 各掃一次；`PositionScanner.syncFromChain()` 改為三階段（發現 → 批次取時間戳 → 建構 seedPositions）
-- [x] **Aerodrome unclaimed fees 修正**：`collect.staticCall` 補上 `{ from: owner }`，讓 `isAuthorizedForToken` 驗證通過；舊版無 from 導致 Aerodrome 手續費永遠為 $0
-- [x] **addPrice 門檻修正**：從 `< 1e-9` 改為 `<= 0`，修正 Aerodrome tick-ratio（~2.9e-12）被誤判為無效價格的問題
-- [x] **BB fallback 最小資料量**：從 `< 2` 改為 `< 5` 筆才 fallback，避免冷啟動時 std dev ≈ 0 導致 BB 帶寬接近零；fallback 標籤從 `'Unknown'` 改為 `'資料累積中'`
-
-### ✅ 階段五-B：Log 系統重構（已完成）
-
-- [x] **logger.ts 強化**：新增 `section()` 分隔線方法、level icon（`·` / `!` / `✖`）、INFO 訊息套用 service 顏色
-- [x] **週期分隔線**：每 5 分鐘 cron 加入 `─── 5m cycle ───` / `─── ready ───` 視覺分隔
-- [x] **訊息類別 emoji**：`⛓` 鏈上、`🌐` API 請求、`💾` 快取、`📍` 倉位、`✅` 完成、`🔄` 重新觸發
-- [x] **去除重複前綴**：移除所有訊息內 `[ServiceName]` 冗餘前綴（tag 已標示）
-
-### 🔴 階段五-C：positions.log 可讀性優化（待處理）
-
-- [ ] **positions.log 格式重構**：目前為原始 JSON，改為仿 Telegram 報告的文字格式，每筆快照排版如下：
-
-```
-[2026-03-06 17:05] ━━ #1675918 PancakeSwap 0.01% ━━
-倉位 $12,400 | APR 67.2% | 健康 94/100
-👛 0xaBcD...1234
-💹 當前 0.02921 | Low Vol (震盪市)
-  你的: 0.02803 ~ 0.03054
-  BB:   0.02628 ~ 0.03213
-💸 Unclaimed $4.6 | IL +$18.2 🟢
-⏱ Breakeven 0天 | Compound ✅
-────────────────────────────────
-```
-
-  - 修改位置：`src/utils/logger.ts` `positionLogger` 的 `format`（改為 `printf` 純文字）
-  - 修改位置：`src/services/PositionScanner.ts` `logPositionSnapshots()`（傳入格式化字串而非 JSON 物件）
-  - 每個 5 分鐘週期的快照之間加入分隔線，方便區分時間點
-
-### ✅ 階段五-D：Telegram 報告優化（已完成）
-
 - [x] **總覽區塊**：報告最上方新增總倉位 USD、Unclaimed、總獲利 USD+%（`PnlCalculator.calculatePortfolioSummary()`）
 - [x] **開倉資訊取代淨APR**：改顯示 `⏳ 開倉 X天X小時 · 獲利 +X.XX%`，邏輯集中於 `PnlCalculator.calculateOpenInfo()`
 - [x] **Breakeven 優化**：IL ≥ 0 時顯示「盈利中」取代天數
@@ -321,37 +311,53 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 - [x] **倉位標頭改版**：移除 APR，改顯示 `倉位 $xxx | 本金 $xxx | 健康 xx/100`；新增 `PnlCalculator.getInitialCapital(tokenId)` static method 讀取 `.env` 設定值
 - [x] **組合總覽加入本金**：`PortfolioSummary` 新增 `totalInitialCapital` 欄位，Telegram 總覽區塊顯示合計本金
 
-### 🔴 階段五-E：Aerodrome Unclaimed 顯示 $0.0 修正（待處理）
+### ✅ 階段五：系統穩定性與強化（已完成）
 
-- [ ] **Aerodrome Gauge 手續費取值失敗**：質押至 Gauge 的倉位 `fetchAerodromeGaugeFees()` 目前回傳 0，`tokensOwed0/1` fallback 對 staked NFT 也為 0（NPM 倉位已清零）
-  - 調查方向：Aerodrome Gauge 合約的 `earned()` / `fees()` / `rewardPerToken()` 等函式；或透過 Gauge 合約直接讀取累積手續費
-  - 相關檔案：`src/services/PositionScanner.ts` → `fetchAerodromeGaugeFees()`
-  - 相關合約：`AERO_GAUGE_ABI`（`src/config/abis.ts`）、Voter `0x16613524e02ad97eDfeF371bC883F2F5d6C480A5`
-
-### 🟡 階段六：計算精度與測試（待處理）
-
+- [x] **狀態持久化**：`PriceBuffer`、`volCache`、`openTimestampCache`、Bot 排序偏好 存入 `data/state.json`（`src/utils/stateManager.ts`）
+- [x] **記憶體管理**：`volCache` 集中至 `src/utils/cache.ts`，改用 `lru-cache`（max: 100）
+- [x] **動態 Gas Oracle**：`src/utils/rpcProvider.ts` 新增 `fetchGasCostUSD()`，即時取得 `maxFeePerGas × GAS_UNITS × ETH_PRICE`，5 分鐘快取；`RiskManager.analyzePosition()` 接受 `gasCostUSD?` 參數
+- [x] **Pool Address 輸入校驗**：`PoolScanner.fetchPoolStats()` 加入 `/^0x[0-9a-fA-F]{40}$/` 驗證
+- [x] **rpcRetry 補強**：除 rate-limit 外，新增對 `SERVER_ERROR`（502/503）的重試邏輯，避免公共節點瞬斷直接失敗
+- [x] **ChainEventScanner**：`src/services/ChainEventScanner.ts`，取代 `OpenTimestampService.ts`，以 `ScanHandler` 介面統一所有 `getLogs` 掃描邏輯（分塊 2000 blocks、連續失敗上限 3 次、chunk delay 100ms）；`OpenTimestampHandler` 移入此模組；`PositionScanner.syncFromChain()` 改為透過 `chainEventScanner.scan()` 批次掃描
+- [x] **Aerodrome unclaimed fees 修正**：`collect.staticCall` 補上 `{ from: owner }`，讓 `isAuthorizedForToken` 驗證通過；舊版無 from 導致 Aerodrome 手續費永遠為 $0
+- [x] **addPrice 門檻修正**：從 `< 1e-9` 改為 `<= 0`，修正 Aerodrome tick-ratio（~2.9e-12）被誤判為無效價格的問題
+- [x] **BB fallback 最小資料量**：從 `< 2` 改為 `< 5` 筆才 fallback，避免冷啟動時 std dev ≈ 0 導致 BB 帶寬接近零；fallback 標籤從 `'Unknown'` 改為 `'資料累積中'`
+- [x] **logger.ts 強化**：新增 `section()` 分隔線方法、level icon（`·` / `!` / `✖`）、INFO 訊息套用 service 顏色
+- [x] **週期分隔線**：每 5 分鐘 cron 加入 `─── 5m cycle ───` / `─── ready ───` 視覺分隔
+- [x] **訊息類別 emoji**：`⛓` 鏈上、`🌐` API 請求、`💾` 快取、`📍` 倉位、`✅` 完成、`🔄` 重新觸發
+- [x] **去除重複前綴**：移除所有訊息內 `[ServiceName]` 冗餘前綴（tag 已標示）
+- [x] **positions.log 格式重構**：改為純文字結構化格式，每筆快照排版如下：
+  - `positionLogger` 使用 `printf` 純文字格式（`src/utils/logger.ts`）
+  - `PositionRecord` 新增 `apr` 欄位，`scanPosition` 存入 `poolStats.apr`
+  - `formatPositionLog()` 改為帶時間戳標頭的結構化純文字（`src/services/PositionScanner.ts`）
+  - 每個 5 分鐘週期前輸出 `═══ [timestamp] Snapshot ═══` 分隔線
+- [x] **Aerodrome staked 手續費重構**：staked 倉位改為 `voter.gauges()` → `gauge.pendingFees(tokenId)` → `collect.staticCall({from: gauge})` → `tokensOwed` 四級 fallback；unstaked 使用 pool feeGrowth 數學計算；解決舊版 staked 倉位 unclaimed 永遠為 $0 的問題
+- [x] **第三幣獎勵支援**：`PositionRecord` 新增 `unclaimed2` / `fees2USD` / `token2Symbol`；PancakeSwap staked → `masterchef.pendingCake(tokenId)`；Aerodrome staked → `gauge.earned(depositorWallet, tokenId)`；`unclaimedFeesUSD` 已含第三幣 USD 值
+- [x] **isStaked 自動偵測**：`ownerOf` 回傳非已知錢包 → `isStaked=true`；`depositorWallet` 透過 `gauge.stakedContains()` 或 `masterchef.userPositionInfos()` 反查實際持有者
+- [x] **BBEngine EWMA stdDev**：資料 ≥ 5 筆（`MIN_CANDLES_FOR_EWMA`）時改用 EWMA（`α=0.3, β=0.7`）平滑後計算 stdDev，取代原始方差；不足時改由 30D 年化波動率換算 1H stdDev（`sma × vol / √8760`），確保冷啟動也有合理帶寬
+- [x] **k 值調整**：震盪市 `1.2 → 1.5`，趨勢市 `1.8 → 2.0`，regime 標籤以 `k ≤ 1.5` 分界
+- [x] **常數集中化**：BB 參數（`BB_K_LOW_VOL`、`BB_K_HIGH_VOL`、`BB_MAX_OFFSET_PCT`、`EWMA_ALPHA/BETA`、`MIN_CANDLES_FOR_EWMA`）、區塊掃描參數（`BLOCK_SCAN_CHUNK`、`BLOCK_LOOKBACK`、`COLLECTED_FEES_MAX_FAILURES`）、Gas 常數全數移至 `constants.ts`
+- [x] **ChainEventScanner 重構**：`OpenTimestampService.ts` 廢棄，所有 `getLogs` 掃描邏輯集中至 `ChainEventScanner.ts`；新增 `ScanHandler` 介面，未來新增事件類型無需修改核心掃描迴圈
+- [x] **Subgraph 停用**：`SUBGRAPHS` 常數清空（endpoints 已注解），所有池子直接使用 GeckoTerminal
 - [x] **INITIAL_INVESTMENT_USD 維護**：已改為 `.env` 編號變數（`INITIAL_INVESTMENT_<tokenId>`）
 - [x] **TRACKED_TOKEN_IDS 維護**：已改為 `.env` 編號變數（`TRACKED_TOKEN_<tokenId>=<DEX>`）
-- [ ] **重構 PnlCalculator & RiskManager**：與 `@uniswap/v3-sdk` 原生數學對齊
-- [ ] **擴充 Jest 測試**：動態 Gas 閾值、零 TVL、極端 Tick、最大波動率等邊界情境
-
-### 🔵 階段七：架構整理（待處理）
-
-- [ ] **整合共用型別**：`PoolStats`、`BBResult`、`PositionRecord`、`RiskAnalysis` 移至 `src/types/index.ts`
-
-### 📄 階段八：部署（待處理）
-
-- [ ] **新增 Dockerfile**：包含 Railway 部署指南
-
-### 🟡 階段九：啟動速度優化（部分待處理）
-
 - [x] **Round-robin RPC**：`nextProvider()` 串行呼叫自動輪換節點，分散負載
 - [x] **移除死節點**：`base.meowrpc.com` 返回 308，已從 `RPC_FALLBACKS` 移除
 - [x] **State 恢復 positions**：重啟時若 wallet 配置未變，直接從 `state.json` 恢復 tokenId 清單，跳過 `syncFromChain`（省 20-50s）
 - [x] **DexScreener 價格快取**：BBEngine 的 WETH/cbBTC 價格快取 2 分鐘，同週期只打一次 API
+
+### 🟡 階段六：計算精度、優化與測試（待處理）
+
+- [ ] **重構 PnlCalculator & RiskManager**：與 `@uniswap/v3-sdk` 原生數學對齊
+- [ ] **擴充 Jest 測試**：動態 Gas 閾值、零 TVL、極端 Tick、最大波動率等邊界情境
 - [ ] **PoolScanner 平行化**：`scanAllCorePools` 目前 5 個池子串行（~30s），改為 `Promise.all` 平行掃描
   - ⚠️ **注意 GeckoTerminal rate-limit**：`fetchPoolVolume` 用 GeckoTerminal 免費 API，429 很常見
   - 平行化前須確認：`poolVolCache`（30 分鐘 TTL）已命中時不發請求；第一次 cold-start 建議限制並發數（最多 2-3 個同時），或加入 Exponential Backoff + Jitter
   - slot0 RPC 呼叫已有 `nextProvider()` 輪換，平行化安全
   - `fetchPoolStats` 內的 DexScreener 呼叫（不同 URL per pool）可安全平行
+
+### 🔵 階段七：架構整理與部署（待處理）
+
+- [ ] **整合共用型別**：`PoolStats`、`BBResult`、`PositionRecord`、`RiskAnalysis` 移至 `src/types/index.ts`
+- [x] **新增 Dockerfile**：multi-stage build（builder → runner）+ `.dockerignore`；README.md 新增 Railway 部署步驟（Volume 掛載、環境變數設定）
 
