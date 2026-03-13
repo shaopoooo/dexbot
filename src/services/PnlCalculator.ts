@@ -54,7 +54,7 @@ export class PnlCalculator {
         openTimestampMs: number | undefined,
         ilUSD: number | null
     ): OpenInfo | null {
-        if (!openTimestampMs) return null;
+        if (!openTimestampMs || openTimestampMs < 0) return null;
 
         const elapsedMs = Date.now() - openTimestampMs;
         const days = Math.floor(elapsedMs / 86400000);

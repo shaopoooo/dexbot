@@ -2,32 +2,18 @@ import axios from 'axios';
 import { nearestUsableTick } from '@uniswap/v3-sdk';
 import { bbVolCache, BBVolEntry } from '../utils/cache';
 import { createServiceLogger } from '../utils/logger';
+import { geckoRequest } from '../utils/rpcProvider';
 import { config } from '../config';
+import { getTokenPrices } from '../utils/tokenPrices';
+import { BBResult } from '../types';
+
+export type { BBResult };
 
 const log = createServiceLogger('BBEngine');
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-export interface BBResult {
-  sma: number;
-  upperPrice: number;
-  lowerPrice: number;
-  k: number;
-  volatility30D: number;
-  tickLower: number;
-  tickUpper: number;
-  ethPrice: number;
-  cbbtcPrice: number;
-  cakePrice: number;
-  aeroPrice: number;
-  minPriceRatio: number;
-  maxPriceRatio: number;
-  isFallback?: boolean;
-  regime: string;
-}
 
-
-let tokenPriceCache: { ethPrice: number; cbbtcPrice: number; cakePrice: number; aeroPrice: number; expiresAt: number } | null = null;
 
 /** Compute annualized vol from a list of prices (closes). */
 function calcVol(prices: number[]): number {
@@ -56,10 +42,10 @@ async function fetchDailyVol(poolAddress: string, dex: 'Uniswap' | 'PancakeSwap'
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       log.info(`🌐 30D vol  ${tag}  attempt ${attempt}/3`);
-      const res = await axios.get(
+      const res = await geckoRequest(() => axios.get(
         `${config.API_URLS.GECKOTERMINAL_OHLCV}/${key}/ohlcv/day?limit=30`,
-        { timeout: 8000 }
-      );
+        { timeout: 8000, headers: { 'User-Agent': 'DexBot/1.0' } }
+      ));
 
       const dailyList: any[][] = res.data?.data?.attributes?.ohlcv_list ?? [];
       if (dailyList.length > 1) {
@@ -69,10 +55,13 @@ async function fetchDailyVol(poolAddress: string, dex: 'Uniswap' | 'PancakeSwap'
       }
       break; // Valid response but no data, don't retry
     } catch (e: any) {
+      const is429 = e.response?.status === 429;
       if (attempt < 3) {
-        const is429 = e.response?.status === 429;
-        log.warn(`GeckoTerminal ${is429 ? '429 rate-limit' : 'error'}  ${tag}  retry in 10s (${attempt}/3)`);
-        await delay(10000);
+        // 指數退避 + jitter：429 → 15s/30s，其他錯誤 → 5s/10s
+        const base = is429 ? 15000 : 5000;
+        const backoff = base * attempt + Math.random() * 5000;
+        log.warn(`GeckoTerminal ${is429 ? '429' : 'error'}  ${tag}  retry in ${(backoff / 1000).toFixed(1)}s (${attempt}/3)`);
+        await delay(backoff);
       } else {
         log.error(`30D vol fetch failed after 3 attempts  ${tag}: ${e.message}`);
       }
@@ -192,6 +181,12 @@ export function restorePriceBuffer(data: Record<string, Record<string, number>>)
   globalPriceBuffer.restore(data);
 }
 
+/** 在 runPoolScanner 後、runBBEngine 前呼叫，確保 buffer 有最新當前小時 entry。 */
+export function refreshPriceBuffer(poolAddress: string, currentTick: number) {
+  const price = Math.pow(1.0001, currentTick);
+  globalPriceBuffer.addPrice(poolAddress, price);
+}
+
 export class BBEngine {
   /**
    * Fetches historical OHLCV data from GeckoTerminal (Free API, requires no key)
@@ -222,6 +217,7 @@ export class BBEngine {
       // 4. stdDev：資料 >= 5 筆用 EWMA 平滑後計算；不足時從 30D 年化波動率換算 1H stdDev
       //    annualizedVol = hourlyStdDev × √(365 × 24)  →  hourlyStdDev = sma × annualizedVol / √8760
       let stdDev1H: number;
+      let isWarmupFallback = false;
       if (prices1H.length >= config.MIN_CANDLES_FOR_EWMA) {
         let smoothedPrices = [...prices1H];
         for (let i = 1; i < smoothedPrices.length; i++) {
@@ -230,9 +226,10 @@ export class BBEngine {
         const variance1H = smoothedPrices.reduce((sum: number, p: number) => sum + Math.pow(p - sma, 2), 0) / smoothedPrices.length;
         stdDev1H = Math.sqrt(variance1H);
       } else {
-        // 冷啟動：用 30D vol 換算 1H stdDev，regime 仍有效
+        // 冷啟動：用 30D vol 換算 1H stdDev；標記 isFallback 讓 UI 顯示「資料累積中」
         stdDev1H = sma * annualizedVol / Math.sqrt(365 * 24); // √(365×24) = √8760 hourly annualization
-        log.info(`📊 vol-derived stdDev  ${poolAddress.slice(0, 10)}  candles=${prices1H.length}/20  stdDev=${stdDev1H.toExponential(3)}`);
+        isWarmupFallback = true;
+        log.info(`📊 vol-derived stdDev  ${poolAddress.slice(0, 10)}  candles=${prices1H.length}/${config.MIN_CANDLES_FOR_EWMA}  stdDev=${stdDev1H.toExponential(3)} (warmup)`);
       }
 
       const maxOffset = sma * config.BB_MAX_OFFSET_PCT;
@@ -251,31 +248,8 @@ export class BBEngine {
       const tickLower = nearestUsableTick(tickLowerRaw, tickSpacing);
       const tickUpper = nearestUsableTick(tickUpperRaw, tickSpacing);
 
-      // Fetch WETH / cbBTC / CAKE / AERO prices from DexScreener（5分鐘快取）
-      let ethPrice = 0, cbbtcPrice = 0, cakePrice = 0, aeroPrice = 0;
-      if (tokenPriceCache && Date.now() < tokenPriceCache.expiresAt) {
-        ({ ethPrice, cbbtcPrice, cakePrice, aeroPrice } = tokenPriceCache);
-      } else {
-        try {
-          const bestPrice = (pairs: any[]) =>
-            parseFloat((pairs?.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0])?.priceUsd || '0');
-          const [wethRes, cbbtcRes, cakeRes, aeroRes] = await Promise.all([
-            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.WETH}`,  { timeout: 5000 }),
-            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.CBBTC}`, { timeout: 5000 }),
-            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.CAKE}`,  { timeout: 5000 }),
-            axios.get(`${config.API_URLS.DEXSCREENER_TOKENS}/${config.TOKEN_ADDRESSES.AERO}`,  { timeout: 5000 }),
-          ]);
-          ethPrice   = bestPrice(wethRes.data?.pairs);
-          cbbtcPrice = bestPrice(cbbtcRes.data?.pairs);
-          cakePrice  = bestPrice(cakeRes.data?.pairs);
-          aeroPrice  = bestPrice(aeroRes.data?.pairs);
-          tokenPriceCache = { ethPrice, cbbtcPrice, cakePrice, aeroPrice, expiresAt: Date.now() + config.TOKEN_PRICE_CACHE_TTL_MS };
-          log.info(`💹 WETH $${ethPrice.toFixed(0)}  cbBTC $${cbbtcPrice.toFixed(0)}  CAKE $${cakePrice.toFixed(3)}  AERO $${aeroPrice.toFixed(3)}`);
-        } catch (e: any) {
-          log.warn(`token price fetch failed: ${e.message}`);
-          if (tokenPriceCache) ({ ethPrice, cbbtcPrice, cakePrice, aeroPrice } = tokenPriceCache);
-        }
-      }
+      // 幣價由獨立的 tokenPrices 模組管理，BBEngine 只讀快取
+      const { ethPrice, cbbtcPrice, cakePrice, aeroPrice } = getTokenPrices();
 
       const minPriceRatio = ethPrice > 0 ? ethPrice / upperPrice : 0;
       const maxPriceRatio = ethPrice > 0 ? ethPrice / lowerPrice : 0;
@@ -294,7 +268,8 @@ export class BBEngine {
         aeroPrice,
         minPriceRatio,
         maxPriceRatio,
-        regime
+        isFallback: isWarmupFallback,
+        regime: isWarmupFallback ? '資料累積中' : regime,
       };
 
     } catch (error) {

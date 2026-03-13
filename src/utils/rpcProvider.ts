@@ -1,7 +1,25 @@
 import { ethers } from 'ethers';
 import axios from 'axios';
+import pLimit from 'p-limit';
 import { config } from '../config';
 import { createServiceLogger } from './logger';
+
+/** GeckoTerminal 速率控制（免費 API：並發 1，最小間隔 1500ms） */
+const _geckoQueue = pLimit(1);
+let _lastGeckoMs = 0;
+const GECKO_MIN_INTERVAL_MS = 1500;
+
+export async function geckoRequest<T>(fn: () => Promise<T>): Promise<T> {
+    return _geckoQueue(async () => {
+        const wait = GECKO_MIN_INTERVAL_MS - (Date.now() - _lastGeckoMs);
+        if (wait > 0) await delay(wait);
+        _lastGeckoMs = Date.now();
+        return fn();
+    });
+}
+
+/** @deprecated 改用 geckoRequest() */
+export const geckoLimiter = _geckoQueue;
 
 const log = createServiceLogger('RPC');
 

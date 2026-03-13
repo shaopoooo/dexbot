@@ -1,6 +1,12 @@
 /**
  * Fixed-point BigInt math utility to replace decimal.js
  */
+
+/** Convert a Uniswap V3 tick to a human-readable price ratio, adjusted for token decimals. */
+export function tickToPrice(tick: number, dec0: number, dec1: number): number {
+    return Math.pow(1.0001, tick) * Math.pow(10, dec0 - dec1);
+}
+
 export const Q96 = 2n ** 96n;
 export const PRECISION = 10n ** 18n;
 
