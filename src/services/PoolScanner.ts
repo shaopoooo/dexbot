@@ -3,21 +3,12 @@ import axios from 'axios';
 import { poolVolCache } from '../utils/cache';
 import { config } from '../config';
 import { createServiceLogger } from '../utils/logger';
-import { rpcProvider, rpcRetry, delay, nextProvider } from '../utils/rpcProvider';
+import { rpcProvider, rpcRetry, delay, nextProvider, geckoRequest } from '../utils/rpcProvider';
+import { PoolStats } from '../types';
+
+export type { PoolStats };
 
 const log = createServiceLogger('PoolScanner');
-
-export interface PoolStats {
-    id: string;
-    dex: 'Uniswap' | 'PancakeSwap' | 'Aerodrome';
-    feeTier: number;
-    apr: number;
-    tvlUSD: number;
-    dailyFeesUSD: number;
-    tick: number;
-    sqrtPriceX96: bigint;
-    volSource: string; // data lineage: e.g. 'The Graph (PancakeSwap)', 'GeckoTerminal'
-}
 
 
 const VOL_CACHE_TTL_MS = config.POOL_VOL_CACHE_TTL_MS;
@@ -84,13 +75,13 @@ async function fetchPoolVolume(poolAddress: string, dex: 'Uniswap' | 'PancakeSwa
         log.warn(`subgraph error  ${tag}: ${e.message}`);
     }
 
-    // --- Try 2: GeckoTerminal OHLCV (with 3 retries, 10s delay) ---
+    // --- Try 2: GeckoTerminal OHLCV (with 3 retries, exponential backoff) ---
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const geckoRes = await axios.get(
-                `https://api.geckoterminal.com/api/v2/networks/base/pools/${key}/ohlcv/day?limit=7`,
-                { timeout: 8000 }
-            );
+            const geckoRes = await geckoRequest(() => axios.get(
+                `${config.API_URLS.GECKOTERMINAL_OHLCV}/${key}/ohlcv/day?limit=7`,
+                { timeout: 8000, headers: { 'User-Agent': 'DexBot/1.0' } }
+            ));
             const ohlcvList: any[][] = geckoRes.data?.data?.attributes?.ohlcv_list ?? [];
             if (ohlcvList.length > 0) {
                 const daily = parseFloat(ohlcvList[0][5]);
@@ -99,10 +90,13 @@ async function fetchPoolVolume(poolAddress: string, dex: 'Uniswap' | 'PancakeSwa
             }
             break; // Valid response but no data, don't retry
         } catch (e: any) {
+            const is429 = e.response?.status === 429;
             const status = e.response?.status ?? 'err';
             if (attempt < 3) {
-                log.warn(`GeckoTerminal ${status}  ${tag}  retry in 10s (${attempt}/3)`);
-                await delay(10000);
+                const base = is429 ? 15000 : 5000;
+                const backoff = base * attempt + Math.random() * 5000;
+                log.warn(`GeckoTerminal ${status}  ${tag}  retry in ${(backoff / 1000).toFixed(1)}s (${attempt}/3)`);
+                await delay(backoff);
             } else {
                 log.error(`GeckoTerminal failed after 3 attempts  ${tag}: ${e.message}`);
             }
@@ -149,7 +143,7 @@ export class PoolScanner {
             const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96);
 
             // 2. Fetch Volume and TVL from DexScreener API as a free fallback
-            const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/pairs/base/${poolAddress}`);
+            const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/pairs/base/${poolAddress}`, { timeout: 8000 });
 
             let tvlUSD = 0;
             let dailyVolumeUSD = 0;
@@ -219,23 +213,13 @@ export class PoolScanner {
      * Scan all core pools and format the output
      */
     static async scanAllCorePools(): Promise<PoolStats[]> {
-        const poolTasks = [
-            { pool: config.POOLS.PANCAKE_WETH_CBBTC_0_01, dex: 'PancakeSwap' as const, fee: 0.0001 },
-            { pool: config.POOLS.PANCAKE_WETH_CBBTC_0_05, dex: 'PancakeSwap' as const, fee: 0.0005 },
-            { pool: config.POOLS.UNISWAP_WETH_CBBTC_0_05, dex: 'Uniswap' as const, fee: 0.0005 },
-            { pool: config.POOLS.UNISWAP_WETH_CBBTC_0_3, dex: 'Uniswap' as const, fee: 0.003 },
-            { pool: config.POOLS.AERO_WETH_CBBTC_0_0085, dex: 'Aerodrome' as const, fee: 0.000085 },
-        ];
+        // GeckoTerminal 呼叫由 geckoLimiter 限制並發數 ≤ 2；slot0 RPC 與 DexScreener 可安全平行
+        const settled = await Promise.allSettled(
+            config.POOL_SCAN_LIST.map(p => this.fetchPoolStats(p.address, p.dex, p.fee))
+        );
 
-        const results: (PoolStats | null)[] = [];
-
-        // Execute sequentially with a random delay to respect standard public API rate limits
-        for (const task of poolTasks) {
-            results.push(await this.fetchPoolStats(task.pool, task.dex, task.fee));
-            const jitterMs = 1500 + Math.random() * 1000;
-            await delay(jitterMs); // 1.5s - 2.5s jitter delay between consecutive pool scans
-        }
-
-        return results.filter((r) => r !== null) as PoolStats[];
+        return settled
+            .filter((r): r is PromiseFulfilledResult<PoolStats> => r.status === 'fulfilled' && r.value !== null)
+            .map(r => r.value);
     }
 }

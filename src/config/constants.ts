@@ -1,4 +1,5 @@
 import { env } from './env';
+import { SortBy } from '../types';
 
 export const constants = {
     // ── Network ────────────────────────────────────────────────────────────
@@ -65,6 +66,11 @@ export const constants = {
     EWMA_ALPHA: 0.3,         // 短期平滑係數
     EWMA_BETA: 0.7,         // 長期平滑係數
     MIN_CANDLES_FOR_EWMA: 5,
+    BANDWIDTH_WINDOW_MAX: 30 * 24 * 12, // 30D × 288 cycles/day (5-min interval) = 8640
+
+    // ── Scheduler ─────────────────────────────────────────────────────────────
+    DEFAULT_INTERVAL_MINUTES: 10, // 預設排程間隔（分鐘），可透過 /interval 修改
+    TIMESTAMP_MAX_FAILURES: 3,    // mint timestamp 查詢失敗上限，超過後標記 N/A 停止重試
 
     // ── Gas ───────────────────────────────────────────────────────────────
     GAS_UNITS_COMPOUND: 300_000n,  // Base 上 collect + reinvest 估算用 gas
@@ -79,12 +85,27 @@ export const constants = {
         AERO_WETH_CBBTC_0_0085: '0x22aee3699b6a0fed71490c103bd4e5f3309891d5', // Aerodrome Slipstream, fee=85 (0.0085%), tickSpacing=1
     },
 
+    // ── Pool Scan List（驅動 PoolScanner.scanAllCorePools，新增池子只需改此處）──
+    POOL_SCAN_LIST: [
+        { address: '0xC211e1f853A898Bd1302385CCdE55f33a8C4B3f3', dex: 'PancakeSwap' as const, fee: 0.0001 },
+        { address: '0xd974d59e30054cf1abeded0c9947b0d8baf90029', dex: 'PancakeSwap' as const, fee: 0.0005 },
+        { address: '0x7aea2e8a3843516afa07293a10ac8e49906dabd1', dex: 'Uniswap' as const, fee: 0.0005 },
+        { address: '0x8c7080564b5a792a33ef2fd473fba6364d5495e5', dex: 'Uniswap' as const, fee: 0.003 },
+        { address: '0x22aee3699b6a0fed71490c103bd4e5f3309891d5', dex: 'Aerodrome' as const, fee: 0.000085 },
+    ] as { address: string; dex: 'Uniswap' | 'PancakeSwap' | 'Aerodrome'; fee: number }[],
+
     // ── Math Config ───────────────────────────────────────────────────────
     DECIMAL_PRECISION: 18n,
 
     // ── Position Tracking ─────────────────────────────────────────────────
     EOQ_THRESHOLD: 5,  // Unclaimed fees threshold in USD
     CAPITAL: 20000,    // Total deployed capital in USD for scaling calculations
+    DRIFT_WARNING_PCT: 80,          // Overlap % below which to show drift warning
+    RED_ALERT_BREAKEVEN_DAYS: 30,   // IL Breakeven Days 超過此值觸發 RED_ALERT
+    HIGH_VOLATILITY_FACTOR: 2,      // currentBandwidth > factor × avg30D 觸發 HIGH_VOLATILITY_AVOID
+
+    // ── Concurrency ───────────────────────────────────────────────────────
+    AGGREGATE_CONCURRENCY: 4,  // aggregateAll 並行 RPC 請求上限
 
     // ── Contract Addresses on Base ────────────────────────────────────────
     AERO_VOTER_ADDRESS: '0x16613524e02ad97eDfeF371bC883F2F5d6C480A5',
@@ -106,4 +127,12 @@ export const constants = {
     REBALANCE_PRICE_UPPER_MARGIN: 0.9999, // 單邊建倉：上限安全邊際
     REBALANCE_PRICE_LOWER_MARGIN: 1.0001, // 單邊建倉：下限安全邊際
     REBALANCE_GAS_COST_USD: 0.1,         // 單次 rebalance 估算 Gas（USD）
+
+    // ── Telegram Bot ──────────────────────────────────────────────────────
+    SORT_LABELS: {
+        size: '倉位大小',
+        apr: '年化報酬',
+        unclaimed: '可領取',
+        health: '健康值',
+    } as Record<SortBy, string>,
 };

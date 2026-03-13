@@ -1,43 +1,31 @@
 import { Bot } from 'grammy';
 import { config } from '../config';
-import { PoolStats } from '../services/PoolScanner';
-import { RiskAnalysis, RiskManager } from '../services/RiskManager';
-import { BBResult } from '../services/BBEngine';
-import { PositionRecord } from '../services/PositionScanner';
+import { PoolStats, BBResult, PositionRecord, RiskAnalysis, SortBy } from '../types';
 import { createServiceLogger } from '../utils/logger';
-import { PnlCalculator } from '../services/PnlCalculator';
+import { getTokenPrices } from '../utils/tokenPrices';
+import { buildTelegramPositionBlock, fmtInterval } from '../utils/formatter';
 
 const log = createServiceLogger('TelegramBot');
 
-/** 將極小數字格式化為緊湊表示法：小數點後 ≥2 個零時使用下標 */
-function compactAmount(n: number): string {
-    if (n <= 0) return '0';
-    const s = n.toFixed(20);
-    const dec = s.split('.')[1] || '';
-    let zeros = 0;
-    for (const c of dec) { if (c === '0') zeros++; else break; }
-    if (zeros >= 2) {
-        const sig = dec.slice(zeros, zeros + 4).replace(/0+$/, '');
-        const sub = '₀₁₂₃₄₅₆₇₈₉';
-        const subscript = String(zeros).split('').map(d => sub[+d]).join('');
-        return `0.0${subscript}${sig}`;
-    }
-    return n.toFixed(zeros + 4).replace(/\.?0+$/, '');
+/** 允許的排程間隔（分鐘）：10 的倍數且能整除 1440，起始對齊每日 00:00 */
+export const VALID_INTERVALS = [10, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440] as const;
+export type IntervalMinutes = typeof VALID_INTERVALS[number];
+
+export function minutesToCron(min: number): string {
+    if (min < 60)   return `*/${min} * * * *`;
+    if (min === 1440) return `0 0 * * *`;
+    return `0 */${min / 60} * * *`;
 }
-
-type SortBy = 'size' | 'apr' | 'unclaimed' | 'health';
-
-const SORT_LABELS: Record<SortBy, string> = {
-    size: '倉位大小',
-    apr: 'APR',
-    unclaimed: 'Unclaimed',
-    health: 'Health Score',
-};
 
 export class TelegramBotService {
     private bot: Bot;
     private chatId: string;
     private sortBy: SortBy = 'size';
+    private onReschedule: ((minutes: number) => void) | null = null;
+
+    setRescheduleCallback(cb: (minutes: number) => void) {
+        this.onReschedule = cb;
+    }
 
     constructor() {
         this.bot = new Bot(config.BOT_TOKEN);
@@ -49,15 +37,15 @@ export class TelegramBotService {
 
         this.bot.command('sort', (ctx) => {
             const key = (ctx.match?.trim() ?? '') as SortBy;
-            const valid = Object.keys(SORT_LABELS) as SortBy[];
+            const valid = Object.keys(config.SORT_LABELS) as SortBy[];
             if (valid.includes(key)) {
                 this.sortBy = key;
-                ctx.reply(`✅ 排序已設為: <b>${SORT_LABELS[key]}</b> ↓`, { parse_mode: 'HTML' });
+                ctx.reply(`✅ 排序已設為: <b>${config.SORT_LABELS[key]}</b> ↓`, { parse_mode: 'HTML' });
             } else {
                 ctx.reply(
                     `排序選項:\n` +
-                    valid.map(k => `  /sort ${k} — ${SORT_LABELS[k]}`).join('\n') +
-                    `\n\n目前排序: <b>${SORT_LABELS[this.sortBy]}</b>`,
+                    valid.map(k => `  /sort ${k} — ${config.SORT_LABELS[k]}`).join('\n') +
+                    `\n\n目前排序: <b>${config.SORT_LABELS[this.sortBy]}</b>`,
                     { parse_mode: 'HTML' }
                 );
             }
@@ -91,11 +79,32 @@ export class TelegramBotService {
                 `&lt; 80% 時觸發，建議重建倉`;
             ctx.reply(msg, { parse_mode: 'HTML' });
         });
+
+        this.bot.command('interval', (ctx) => {
+            const raw = ctx.match?.trim() ?? '';
+            if (!raw) {
+                const opts = VALID_INTERVALS.map(m => `  /interval ${m} — ${fmtInterval(m)}`).join('\n');
+                ctx.reply(`⏱ 排程間隔設定\n\n可用選項:\n${opts}`, { parse_mode: 'HTML' });
+                return;
+            }
+            const min = parseInt(raw, 10);
+            if (!VALID_INTERVALS.includes(min as IntervalMinutes)) {
+                const opts = VALID_INTERVALS.map(m => `${fmtInterval(m)}`).join('、');
+                ctx.reply(`❌ 無效間隔。可用值: ${opts}`);
+                return;
+            }
+            if (this.onReschedule) {
+                this.onReschedule(min);
+                ctx.reply(`✅ 排程已更新為每 <b>${fmtInterval(min)}</b> 執行一次\n（cron: <code>${minutesToCron(min)}</code>）`, { parse_mode: 'HTML' });
+            } else {
+                ctx.reply('❌ 排程功能尚未初始化');
+            }
+        });
     }
 
     public getSortBy(): string { return this.sortBy; }
     public setSortBy(key: string) {
-        const valid = Object.keys(SORT_LABELS) as SortBy[];
+        const valid = Object.keys(config.SORT_LABELS) as SortBy[];
         if (valid.includes(key as SortBy)) this.sortBy = key as SortBy;
     }
 
@@ -121,100 +130,6 @@ export class TelegramBotService {
         }
     }
 
-    /** 格式化單一倉位區塊（供 sendConsolidatedReport 使用） */
-    private formatPositionBlock(
-        index: number,
-        position: PositionRecord,
-        pool: PoolStats,
-        bb: BBResult | null,
-        risk: RiskAnalysis
-    ): string {
-        const label = `${pool.dex} ${(pool.feeTier * 100).toFixed(4).replace(/\.?0+$/, '')}%`;
-        const walletShort = position.ownerWallet && /^0x[0-9a-fA-F]{40}$/.test(position.ownerWallet)
-            ? `${position.ownerWallet.slice(0, 6)}...${position.ownerWallet.slice(-4)}`
-            : '未知';
-        const posValue = position.positionValueUSD > 0
-            ? `$${position.positionValueUSD.toFixed(0)}`
-            : 'N/A';
-        const initialCapital = PnlCalculator.getInitialCapital(position.tokenId);
-        const capitalStr = initialCapital !== null ? `$${initialCapital.toFixed(0)}` : 'N/A';
-
-        // 淨損益 = LP現值 + Unclaimed - 本金（含手續費貢獻）
-        const pnlDisplay = position.ilUSD === null
-            ? '未設定本金'
-            : position.ilUSD >= 0
-                ? `+$${position.ilUSD.toFixed(1)} 🟢`
-                : `-$${Math.abs(position.ilUSD).toFixed(1)} 🔴`;
-
-        // 無常損失 = LP現值 - 本金（純市價波動，不含手續費）
-        const ilOnly = initialCapital !== null ? position.positionValueUSD - initialCapital : null;
-        const ilOnlyDisplay = ilOnly === null
-            ? ''
-            : ilOnly >= 0
-                ? `+$${ilOnly.toFixed(1)} 🟢`
-                : `-$${Math.abs(ilOnly).toFixed(1)} 🔴`;
-
-        const bbBound = (bb && position.bbMinPrice && position.bbMaxPrice)
-            ? `${position.bbMinPrice} ~ ${position.bbMaxPrice}${position.bbFallback ? ' ⚠️' : ''}`
-            : '無數據';
-        const cmp = risk.compoundSignal ? '✅' : '❌';
-
-        const openInfo = PnlCalculator.calculateOpenInfo(position.tokenId, position.openTimestampMs, position.ilUSD);
-        const profitStr = (openInfo?.profitRate !== null && openInfo?.profitRate !== undefined)
-            ? ` · 獲利 <b>${openInfo.profitRate >= 0 ? '+' : ''}${openInfo.profitRate.toFixed(2)}%</b>`
-            : '';
-        const breakevenStr = (position.ilUSD !== null && position.ilUSD >= 0) ? '盈利中' : `${risk.ilBreakevenDays}天`;
-
-        // ── 標頭
-        let block = `\n━━ #${index} ${label} ━━\n`;
-        // ── 錢包（第二行）
-        const lockIcon = position.isStaked ? ' 🔒' : '';
-        block += `👛 ${walletShort} · #${position.tokenId}${lockIcon}\n`;
-        // ── 開倉時間
-        if (openInfo) block += `⏳ 開倉 ${openInfo.timeStr}\n`;
-        // ── 價格 + 區間（縮排）
-        block += `💹 當前 ${position.currentPriceStr} | ${position.regime}\n`;
-        block += ` ├ 你的 ${position.minPrice} ~ ${position.maxPrice}\n`;
-        block += ` └ 建議 ${bbBound}\n`;
-        // ── 倉位摘要（縮排）
-        block += `💼 倉位 ${posValue} | 本金 ${capitalStr} | 健康 ${risk.healthScore}/100\n`;
-        // ── Breakeven + 獲利率同行
-        block += `⌛  Breakeven ${breakevenStr}${profitStr}\n`;
-        // ── 淨損益 + 無常損失
-        block += `💸 淨損益 ${pnlDisplay}`;
-        if (ilOnlyDisplay) block += ` | 無常損失 ${ilOnlyDisplay}`;
-        block += '\n';
-        // ── 建議領取：未領取手續費 + 逐幣明細
-        const dec0 = position.token0Symbol === 'cbBTC' ? 8 : 18;
-        const dec1 = position.token1Symbol === 'cbBTC' ? 8 : 18;
-        const amt0 = Number(BigInt(position.unclaimed0 || '0')) / Math.pow(10, dec0);
-        const amt1 = Number(BigInt(position.unclaimed1 || '0')) / Math.pow(10, dec1);
-        const amt2 = Number(BigInt(position.unclaimed2 || '0')) / 1e18;
-        const feeDetail = [
-            amt0 > 0 ? `${compactAmount(amt0)} ${position.token0Symbol} ($${position.fees0USD.toFixed(2)})` : '',
-            amt1 > 0 ? `${compactAmount(amt1)} ${position.token1Symbol} ($${position.fees1USD.toFixed(2)})` : '',
-            amt2 > 0 && position.token2Symbol ? `${compactAmount(amt2)} ${position.token2Symbol} ($${position.fees2USD.toFixed(2)})` : '',
-        ].filter(Boolean);
-        block += `🔄 未領取手續費 $${position.unclaimedFeesUSD.toFixed(2)} ${cmp} ${risk.compoundSignal ? '&gt;' : '&lt;'} $${risk.compoundThreshold.toFixed(1)}\n`;
-        for (const line of feeDetail) block += `     ${line}\n`;
-        // ── 警示
-        if (risk.redAlert) block += `🚨 <b>RED_ALERT</b>: Breakeven &gt;${RiskManager.RED_ALERT_BREAKEVEN_DAYS}天 (建議減倉)\n`;
-        if (risk.highVolatilityAvoid) block += `⚠️ <b>HIGH_VOLATILITY_AVOID</b> (建議觀望)\n`;
-        if (risk.driftWarning) {
-            block += `⚠️ <b>DRIFT</b> 重疊 ${risk.driftOverlapPct.toFixed(1)}%`;
-            if (position.rebalance) {
-                const rb = position.rebalance;
-                block += ` | 💡 ${rb.strategyName}`;
-                if (rb.estGasCost > 0) block += ` (Gas $${rb.estGasCost.toFixed(2)})`;
-            } else {
-                block += ` (建議依 BB 重建倉)`;
-            }
-            block += '\n';
-        }
-
-        return block;
-    }
-
     /** 將所有倉位合併為單一 Telegram 報告 */
     public async sendConsolidatedReport(
         entries: Array<{ position: PositionRecord; pool: PoolStats; bb: BBResult | null; risk: RiskAnalysis }>,
@@ -226,8 +141,14 @@ export class TelegramBotService {
             hour: '2-digit', minute: '2-digit', hour12: false,
             timeZone: 'Asia/Taipei',
         });
+        const timeOnlyFormatter = new Intl.DateTimeFormat('zh-TW', {
+            hour: '2-digit', minute: '2-digit', hour12: false,
+            timeZone: 'Asia/Taipei',
+        });
         const timeStr = timeFormatter.format(new Date()).replace(/\//g, '-').replace(',', '');
-        const formatTs = (ts: number) => ts === 0 ? '無紀錄' : timeFormatter.format(new Date(ts)).replace(/\//g, '-').replace(',', '').split(' ')[1];
+        // 使用獨立的 time-only formatter 避免 zh-TW locale 在新版 ICU 使用 U+202F
+        // 而非一般空格導致 split(' ') 回傳 undefined
+        const formatTs = (ts: number) => ts === 0 ? '無紀錄' : timeOnlyFormatter.format(new Date(ts));
 
         // 依當前排序鍵由大到小排列
         const sorted = [...entries].sort((a, b) => {
@@ -241,30 +162,38 @@ export class TelegramBotService {
         });
 
         // ── 總覽區塊 ──────────────────────────────────────────────
-        const summary = PnlCalculator.calculatePortfolioSummary(entries.map(e => e.position));
+        const totalPositionUSD    = entries.reduce((s, e) => s + e.position.positionValueUSD, 0);
+        const totalUnclaimedUSD   = entries.reduce((s, e) => s + e.position.unclaimedFeesUSD, 0);
+        const totalInitialCapital = entries.reduce((s, e) => s + (e.position.initialCapital ?? 0), 0);
+        const pnlValues           = entries.map(e => e.position.ilUSD);
+        const totalPnL            = pnlValues.every(v => v !== null)
+            ? pnlValues.reduce((s, v) => s + (v ?? 0), 0) : null;
+        const totalPnLPct         = (totalPnL !== null && totalInitialCapital > 0)
+            ? (totalPnL / totalInitialCapital) * 100 : null;
+        const walletCount         = new Set(
+            entries.map(e => e.position.ownerWallet).filter(w => /^0x[0-9a-fA-F]{40}$/.test(w))
+        ).size;
         const fmtUSD = (v: number) => v >= 0 ? `+$${v.toFixed(1)}` : `-$${Math.abs(v).toFixed(1)}`;
 
-        let msg = `<b>[${timeStr}] 倉位監控報告 (${sorted.length} 個倉位 | 排序: ${SORT_LABELS[this.sortBy]} ↓)</b>`;
-        msg += `\n\n📊 <b>總覽</b>  ${summary.positionCount} 倉位 · ${summary.walletCount} 錢包`;
-        msg += `\n💼 總倉位 <b>$${summary.totalPositionUSD.toFixed(0)}</b>  |  本金 <b>$${summary.totalInitialCapital.toFixed(0)}</b>  |  Unclaimed <b>$${summary.totalUnclaimedUSD.toFixed(1)}</b>`;
+        let msg = `<b>[${timeStr}] 倉位監控報告 (${sorted.length} 個倉位 | 排序: ${config.SORT_LABELS[this.sortBy]} ↓)</b>`;
+        msg += `\n\n📊 <b>總覽</b>  ${entries.length} 倉位 · ${walletCount} 錢包`;
+        msg += `\n💼 總倉位 <b>$${totalPositionUSD.toFixed(0)}</b>  |  本金 <b>$${totalInitialCapital.toFixed(0)}</b>  |  Unclaimed <b>$${totalUnclaimedUSD.toFixed(1)}</b>`;
 
-        // 即時幣價
-        const bb0 = entries.find(e => e.bb)?.bb;
-        if (bb0) {
-            const p = (v: number, d: number) => v > 0 ? `$${v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}` : '–';
-            msg += `\n💱 ETH ${p(bb0.ethPrice, 0)}  BTC ${p(bb0.cbbtcPrice, 0)}  CAKE ${p(bb0.cakePrice, 3)}  AERO ${p(bb0.aeroPrice, 3)}`;
-        }
+        // 即時幣價（由獨立 tokenPrices 模組提供，不依賴 BBEngine 是否成功）
+        const tp = getTokenPrices();
+        const p = (v: number, d: number) => v > 0 ? `$${v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}` : '–';
+        msg += `\n💱 ETH ${p(tp.ethPrice, 0)}  BTC ${p(tp.cbbtcPrice, 0)}  CAKE ${p(tp.cakePrice, 3)}  AERO ${p(tp.aeroPrice, 3)}`;
 
-        if (summary.totalPnL !== null) {
-            const icon = summary.totalPnL >= 0 ? '🟢' : '🔴';
-            const pctStr = summary.totalPnLPct !== null
-                ? ` (${summary.totalPnLPct >= 0 ? '+' : ''}${summary.totalPnLPct.toFixed(2)}%)`
+        if (totalPnL !== null) {
+            const icon = totalPnL >= 0 ? '🟢' : '🔴';
+            const pctStr = totalPnLPct !== null
+                ? ` (${totalPnLPct >= 0 ? '+' : ''}${totalPnLPct.toFixed(2)}%)`
                 : '';
-            msg += `\n💰 總獲利 <b>${fmtUSD(summary.totalPnL)}${pctStr}</b> ${icon}`;
+            msg += `\n💰 總獲利 <b>${fmtUSD(totalPnL)}${pctStr}</b> ${icon}`;
         }
 
         sorted.forEach(({ position, pool, bb, risk }, i) => {
-            msg += this.formatPositionBlock(i + 1, position, pool, bb, risk);
+            msg += buildTelegramPositionBlock(i + 1, position, pool, bb, risk);
         });
 
         // 各池收益排行（顯示一次）

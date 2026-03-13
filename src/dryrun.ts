@@ -8,6 +8,7 @@ import { PoolScanner, PoolStats } from './services/PoolScanner';
 import { BBEngine, BBResult } from './services/BBEngine';
 import { RiskManager, PositionState, RiskAnalysis } from './services/RiskManager';
 import { PositionScanner, PositionRecord } from './services/PositionScanner';
+import { PositionAggregator } from './services/PositionAggregator';
 import { createServiceLogger } from './utils/logger';
 
 const log = createServiceLogger('Dryrun');
@@ -52,9 +53,11 @@ async function main() {
         if (bb) latestBBs[poolAddress] = bb;
     }
 
-    // 4. Position Scanner — update with BB data
+    // 4. Position Scanner — fetch raw chain data, aggregate, then update
     log.info('Running PositionScanner...');
-    await PositionScanner.updateAllPositions(latestBBs);
+    const rawPositions = await PositionScanner.fetchAll();
+    const assembled = await PositionAggregator.aggregateAll(rawPositions, latestBBs, pools);
+    PositionScanner.updatePositions(assembled);
     const updatedPositions = PositionScanner.getTrackedPositions().filter(p => Number(p.liquidity) > 0);
 
     // 5. Risk Manager + print results

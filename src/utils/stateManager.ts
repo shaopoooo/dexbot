@@ -4,12 +4,14 @@
  * 下次啟動時自動從檔案恢復，避免 cold-start 重新爬蟲。
  */
 import * as fs from 'fs-extra';
+import { rename } from 'fs/promises';
 import * as path from 'path';
 import { createServiceLogger } from './logger';
 import { bbVolCache, poolVolCache, snapshotCache, restoreCache, BBVolEntry, PoolVolEntry } from './cache';
 
 const log = createServiceLogger('State');
 const STATE_FILE = path.join(process.cwd(), 'data', 'state.json');
+const TMP_FILE   = STATE_FILE + '.tmp';
 
 export interface DiscoveredPosition {
     tokenId: string;
@@ -22,7 +24,9 @@ export interface PersistedState {
     volCachePool: Record<string, PoolVolEntry>;
     priceBuffer:  Record<string, Record<string, number>>;  // poolAddr → hourTs → price
     openTimestamps: Record<string, number>;                 // `${tokenId}_${dex}` → ms
+    intervalMinutes?: number;                               // cron 排程間隔（分鐘）
     sortBy: string;
+    bandwidthWindows?: Record<string, number[]>;            // poolAddr → rolling 30D bandwidth window
     // 已探索的倉位清單（跳過 syncFromChain）
     discoveredPositions?: DiscoveredPosition[];
     syncedWallets?: string[];   // 當時掃描的 wallet 列表，用於判斷配置是否變更
@@ -49,6 +53,8 @@ export async function saveState(
     sortBy: string,
     discoveredPositions?: DiscoveredPosition[],
     syncedWallets?: string[],
+    bandwidthWindows?: Record<string, number[]>,
+    intervalMinutes?: number,
 ): Promise<void> {
     try {
         await fs.ensureDir(path.dirname(STATE_FILE));
@@ -57,11 +63,15 @@ export async function saveState(
             volCachePool: snapshotCache(poolVolCache),
             priceBuffer,
             openTimestamps,
+            intervalMinutes,
             sortBy,
+            bandwidthWindows,
             discoveredPositions,
             syncedWallets,
         };
-        await fs.writeJson(STATE_FILE, state, { spaces: 2 });
+        // 原子寫入：先寫暫存檔，成功後 rename，避免 SIGINT 截斷導致 JSON 損毀
+        await fs.writeJson(TMP_FILE, state, { spaces: 2 });
+        await rename(TMP_FILE, STATE_FILE);
     } catch (e: any) {
         log.warn(`state save failed: ${e.message}`);
     }

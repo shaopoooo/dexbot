@@ -12,7 +12,6 @@ import { config } from '../config';
 const log = createServiceLogger('ChainEventScanner');
 
 const CHUNK = config.BLOCK_SCAN_CHUNK;
-const LOOKBACK = config.BLOCK_LOOKBACK;
 const MAX_CONSECUTIVE_FAILURES = config.COLLECTED_FEES_MAX_FAILURES;
 const CHUNK_DELAY_MS = config.COLLECTED_FEES_CHUNK_DELAY_MS;
 
@@ -41,14 +40,21 @@ export interface ScanHandler {
     getFromBlock(req: ScanRequest, currentBlock: number): number;
     processLog(log: ethers.Log, req: ScanRequest, blockTimestamp?: number): Promise<void>;
     /**
+     * Called after EACH successful getLogs chunk so handlers can persist
+     * incremental scan progress without waiting for the full scan to finish.
+     */
+    onChunkSuccess?(requests: ScanRequest[], chunkFromBlock: number): void;
+    /**
      * Called after the scan loop for each NPM group.
      * @param successfullyScanned tokenIds included in at least one successful getLogs chunk
+     * @param lowestScannedBlock  lowest fromBlock of any successful chunk (undefined if all failed)
      */
     onBatchComplete(
         npmAddress: string,
         group: ScanRequest[],
         currentBlock: number,
-        successfullyScanned: Set<string>
+        successfullyScanned: Set<string>,
+        lowestScannedBlock?: number,
     ): void;
 }
 
@@ -135,6 +141,8 @@ export class ChainEventScanner {
 
         // Track which tokenIds had at least one successful getLogs chunk
         const successfullyScanned = new Set<string>();
+        // Track lowest fromBlock of any successful chunk (for resume-on-restart)
+        let lowestSuccessfulBlock: number | undefined;
 
         let consecutiveFailures = 0;
 
@@ -166,6 +174,13 @@ export class ChainEventScanner {
                         successfullyScanned.add(req.tokenId);
                     }
                 }
+                // Track lowest successfully fetched block for resume-on-restart
+                if (lowestSuccessfulBlock === undefined || chunkFrom < lowestSuccessfulBlock) {
+                    lowestSuccessfulBlock = chunkFrom;
+                }
+                // Incremental progress: update immediately after each chunk so
+                // saveState() captures real progress even if the full scan hasn't finished.
+                handler.onChunkSuccess?.(activeRequests, chunkFrom);
 
                 for (const l of logs) {
                     const tokenIdTopic = l.topics[handler.tokenIdTopicIndex];
@@ -205,46 +220,116 @@ export class ChainEventScanner {
         // Warn about tokenIds not found for stopOnFirstMatch handlers
         if (pendingSet && pendingSet.size > 0) {
             const missing = Array.from(pendingSet).map(id => `#${id}`).join(', ');
-            log.warn(`[${handler.name}] ${pendingSet.size} tokenId(s) not found within last ${LOOKBACK} blocks: ${missing}`);
+            log.warn(`[${handler.name}] ${pendingSet.size} tokenId(s) not found: ${missing}`);
         }
 
-        handler.onBatchComplete(npmAddress, group, currentBlock, successfullyScanned);
+        handler.onBatchComplete(npmAddress, group, currentBlock, successfullyScanned, lowestSuccessfulBlock);
     }
 }
 
+// ─── Binary-search mint timestamp ────────────────────────────────────────────
+
+const OWNER_OF_ABI = ['function ownerOf(uint256) view returns (address)'];
+
+/**
+ * Returns true if the NPM tokenId exists at the given historical block.
+ * Uses direct eth_call (no rpcRetry) so CALL_EXCEPTION from "nonexistent token"
+ * is treated as false without noisy error logging or unnecessary retries.
+ */
+async function tokenExistsAtBlock(
+    npmAddress: string,
+    tokenIdBigInt: bigint,
+    blockTag: number,
+): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const contract = new ethers.Contract(npmAddress, OWNER_OF_ABI, nextProvider());
+            await contract.ownerOf(tokenIdBigInt, { blockTag });
+            return true;
+        } catch (e: any) {
+            if (e.code === 'CALL_EXCEPTION') return false; // token not yet minted
+            if (attempt < 2) { await delay(2000 * (attempt + 1)); continue; }
+            throw e;
+        }
+    }
+    return false;
+}
+
+/**
+ * Locates the mint block for an LP NFT using binary search on ownerOf() at
+ * historical blocks, then fetches the exact timestamp via getLogs on the
+ * narrow ~CHUNK-block window.
+ *
+ * Complexity: O(log(currentBlock)) ≈ 15 RPC calls vs O(LOOKBACK/CHUNK) ≈ 1500
+ * for the old linear scan.
+ */
+export async function findMintTimestampMs(
+    tokenId: string,
+    npmAddress: string,
+): Promise<number | null> {
+    log.info(`🔍 [MintSearch] #${tokenId} binary search on ${npmAddress.slice(0, 10)}…`);
+
+    let currentBlock: number;
+    try {
+        currentBlock = await rpcRetry(() => nextProvider().getBlockNumber(), 'getBlockNumber');
+    } catch (e: any) {
+        log.warn(`[MintSearch] getBlockNumber failed: ${e.message}`);
+        return null;
+    }
+
+    const tokenIdBigInt = BigInt(tokenId);
+    let lo = 1;
+    let hi = currentBlock;
+
+    // Binary search: narrow down to the exact block (hi - lo === 0)
+    while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const exists = await tokenExistsAtBlock(npmAddress, tokenIdBigInt, mid);
+        if (exists) {
+            hi = mid - 1; // mint could be at mid or before
+        } else {
+            lo = mid + 1; // mint is definitely after mid
+        }
+    }
+
+    // Now lo is exactly the block where the token first exists
+    const mintBlock = lo;
+    if (mintBlock > currentBlock) {
+         log.warn(`[MintSearch] #${tokenId} token exists binary search failed (lo > currentBlock)`);
+         return null;
+    }
+
+
+    let block: ethers.Block | null;
+    try {
+        block = await rpcRetry(
+            () => nextProvider().getBlock(mintBlock),
+            `getBlock(${mintBlock})`,
+        );
+    } catch (e: any) {
+        log.warn(`[MintSearch] getBlock(${mintBlock}) failed: ${e.message?.slice(0, 60)}`);
+        return null;
+    }
+
+    if (!block) return null;
+    const tsMs = block.timestamp * 1000;
+    log.info(`💾 [MintSearch] #${tokenId} minted at block ${mintBlock} (${new Date(tsMs).toISOString().slice(0, 10)})`);
+    return tsMs;
+}
+
 // ─── OpenTimestampHandler ────────────────────────────────────────────────────
+// Acts only as an in-memory cache; timestamp discovery is now done via
+// findMintTimestampMs() binary search (not getLogs linear scan).
 
-class OpenTimestampHandler implements ScanHandler {
-    name = 'OpenTimestamp';
-    topic0 = TRANSFER_TOPIC;
-    tokenIdTopicIndex = 3 as const;
-    extraTopics: (string | null)[] = [FROM_ZERO_TOPIC, null];
-    stopOnFirstMatch = true;
-    needsBlockTimestamp = true;
-
-    private cache = new Map<string, number>(); // `${tokenId}_${dex}` → tsMs
-
-    getFromBlock(req: ScanRequest, currentBlock: number): number {
-        const key = `${req.tokenId}_${req.dex}`;
-        if (this.cache.has(key)) return currentBlock + 1; // already cached, skip
-        return Math.max(0, currentBlock - LOOKBACK);
-    }
-
-    async processLog(l: ethers.Log, req: ScanRequest, blockTimestamp?: number): Promise<void> {
-        if (blockTimestamp === undefined) return;
-        const key = `${req.tokenId}_${req.dex}`;
-        if (this.cache.has(key)) return;
-        const tsMs = blockTimestamp * 1000;
-        this.cache.set(key, tsMs);
-        log.info(`💾 #${req.tokenId} opened at block ${l.blockNumber} (${new Date(tsMs).toISOString().slice(0, 10)})`);
-    }
-
-    onBatchComplete(_npm: string, _group: ScanRequest[], _currentBlock: number, _success: Set<string>): void {
-        // Warning for missing tokenIds already handled by ChainEventScanner
-    }
+class OpenTimestampHandler {
+    private readonly cache = new Map<string, number>(); // `${tokenId}_${dex}` → tsMs
 
     getCachedTimestamp(key: string): number | undefined {
         return this.cache.get(key);
+    }
+
+    setCachedTimestamp(key: string, tsMs: number): void {
+        this.cache.set(key, tsMs);
     }
 
     snapshot(): Record<string, number> {
@@ -252,9 +337,7 @@ class OpenTimestampHandler implements ScanHandler {
     }
 
     restore(data: Record<string, number>): void {
-        for (const [k, v] of Object.entries(data)) {
-            this.cache.set(k, v);
-        }
+        for (const [k, v] of Object.entries(data)) this.cache.set(k, v);
     }
 }
 
@@ -262,8 +345,8 @@ class OpenTimestampHandler implements ScanHandler {
 
 export const openTimestampHandler = new OpenTimestampHandler();
 
+/** chainEventScanner is kept for future handlers (e.g. Collect event tracking). */
 export const chainEventScanner = new ChainEventScanner();
-chainEventScanner.registerHandler(openTimestampHandler);
 
 // ─── Module-level exports ─────────────────────────────────────────────────────
 

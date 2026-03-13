@@ -35,3 +35,15 @@ export const env = {
         return map;
     })(),
 };
+
+/** 驗證必填環境變數，缺少時輸出錯誤並中止程式 */
+export function validateEnv(): void {
+    const missing: string[] = [];
+    if (!process.env.BOT_TOKEN)       missing.push('BOT_TOKEN');
+    if (!process.env.CHAT_ID)         missing.push('CHAT_ID');
+    if (!process.env.WALLET_ADDRESS_1) missing.push('WALLET_ADDRESS_1');
+    if (missing.length > 0) {
+        console.error(`[env] 缺少必填環境變數: ${missing.join(', ')}\n請確認 .env 檔案或部署環境的環境變數設定。`);
+        process.exit(1);
+    }
+}

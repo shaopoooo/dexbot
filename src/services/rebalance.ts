@@ -1,18 +1,11 @@
-import { BBEngine, BBResult } from './BBEngine';
+import { BBResult } from '../types';
 import { createServiceLogger } from '../utils/logger';
 import { config } from '../config';
+import { RebalanceSuggestion } from '../types';
+
+export type { RebalanceSuggestion };
 
 const log = createServiceLogger('RebalanceService');
-
-export interface RebalanceSuggestion {
-    newMinPrice: number;
-    newMaxPrice: number;
-    recommendedStrategy: 'wait' | 'dca' | 'withdrawSingleSide' | 'avoidSwap';
-    strategyName: string; // 中文策略名稱
-    driftPercent: number; // 超出百分比
-    estGasCost: number; // 估算 Gas USD
-    notes: string; // 推薦說明
-}
 
 /**
  * 計算在特定區間 [P_lower, P_upper] 下，當前價格 P_current 所需的 Token0 與 Token1 價值比例
@@ -76,9 +69,17 @@ export class RebalanceService {
         breakevenDays: number,
         positionValueUSD: number,
         token0Symbol: string,
-        token1Symbol: string
+        token1Symbol: string,
+        gasCostUSD?: number
     ): RebalanceSuggestion | null {
         try {
+            const gasCost = gasCostUSD ?? config.REBALANCE_GAS_COST_USD;
+
+            // 方向性偏移：以 currentPrice 相對 SMA 的偏差方向決定單邊建倉中心點偏移量
+            // sd = 1σ 價格標準差（由 BB 帶寬反推）；offset = 0.3σ × 方向
+            const sd = currentBB.k > 0 ? (currentBB.upperPrice - currentBB.sma) / currentBB.k : 0;
+            const sdOffset = 0.3 * sd * (currentPrice > currentBB.sma ? 1 : -1);
+
             // 步驟 1: 計算超出百分比 (driftPercent)
             let driftPercent = 0;
             if (currentPrice > currentBB.maxPriceRatio) {
@@ -103,6 +104,7 @@ export class RebalanceService {
                 strategyName = '等待回歸';
                 notes = '超出小，等待價格回歸（零成本，IL 無鎖定）';
             } else if (Math.abs(driftPercent) < config.REBALANCE_DCA_DRIFT_PCT && unclaimedFeesUSD > threshold) {
+
                 recommendedStrategy = 'dca';
                 strategyName = 'DCA 定投平衡';
                 // 為了完美補齊倉位，我們需要精算 BBEngine 建議的新區間 (newBB) 實際上需要多少的 Token0/Token1 比例
@@ -134,9 +136,10 @@ export class RebalanceService {
                 if (driftPercent > 0) {
                     // 價格漲過頭 (向上飄移)，我們手上 100% 都是 Token1 (Quote，通常為 WETH 或 USDC)
                     // 策略：用手上的 Token1 在市價「下方」接盤，等待價格跌回均線 (SMA)
+                    // SD offset：強勢時中心上移 0.3σ，弱勢時下移 0.3σ，讓接盤區間更貼近均值回歸路徑
                     remainingToken = token1Symbol;
                     singleSideMin = newBB.minPriceRatio;
-                    singleSideMax = newBB.sma;
+                    singleSideMax = newBB.sma + sdOffset;
                     // 必須嚴格保證上限低於市價，否則立刻需要另一邊代幣
                     if (singleSideMax >= currentPrice) {
                         singleSideMax = currentPrice * config.REBALANCE_PRICE_UPPER_MARGIN;
@@ -144,13 +147,23 @@ export class RebalanceService {
                 } else {
                     // 價格跌過頭 (向下飄移)，我們手上 100% 都是 Token0 (Base，通常為 cbBTC 等)
                     // 策略：用手上的 Token0 在市價「上方」賣出，等待價格漲回均線 (SMA)
+                    // SD offset：弱勢時中心下移 0.3σ（賣單下移，更積極），強勢時上移（更保守）
                     remainingToken = token0Symbol;
-                    singleSideMin = newBB.sma;
+                    singleSideMin = newBB.sma + sdOffset;
                     singleSideMax = newBB.maxPriceRatio;
                     // 必須嚴格保證下限高於市價
                     if (singleSideMin <= currentPrice) {
                         singleSideMin = currentPrice * config.REBALANCE_PRICE_LOWER_MARGIN;
                     }
+                }
+
+                // 划算性檢查：Gas 超過 Unclaimed × 50% 時降級為等待
+                if (unclaimedFeesUSD <= gasCost * 2) {
+                    recommendedStrategy = 'wait';
+                    strategyName = '等待回歸';
+                    notes = `再平衡 Gas ($${gasCost.toFixed(2)}) 超過 Unclaimed Fees 的一半，等待費用累積後再操作`;
+                    newBB.minPriceRatio = currentBB.minPriceRatio;
+                    newBB.maxPriceRatio = currentBB.maxPriceRatio;
                 }
 
                 notes = `偏離過大，建議撤出原 LP 剩餘資產 (目前 100% 為 ${remainingToken})，\n`;
@@ -166,7 +179,7 @@ export class RebalanceService {
             // 永遠避免直接兌換
             notes += '。注意：不建議直接 ETH 換 BTC（低賣高買，IL 高）';
 
-            const estGasCost = recommendedStrategy === 'withdrawSingleSide' ? config.REBALANCE_GAS_COST_USD : 0;
+            const estGasCost = recommendedStrategy === 'withdrawSingleSide' ? gasCost : 0;
 
             return {
                 newMinPrice: newBB.minPriceRatio,

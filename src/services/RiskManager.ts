@@ -1,33 +1,10 @@
-import { BBResult } from './BBEngine';
+import { BBResult, PositionState, RiskAnalysis } from '../types';
 import { config } from '../config';
 
-export interface PositionState {
-    capital: number;           // $20,000 max initially
-    tickLower: number;         // Current position lower tick
-    tickUpper: number;         // Current position upper tick
-    unclaimedFees: number;     // e.g. $12.4
-    cumulativeIL: number;      // e.g. -8.7 (Loss)
-    feeRate24h: number;        // Estimated daily fee rate as % of capital
-}
-
-export interface RiskAnalysis {
-    driftOverlapPct: number;
-    driftWarning: boolean;
-    compoundThreshold: number;
-    compoundSignal: boolean;
-    healthScore: number;
-    ilBreakevenDays: number;
-    redAlert: boolean;
-    highVolatilityAvoid: boolean;
-}
+export type { PositionState, RiskAnalysis };
 
 export class RiskManager {
     private static readonly COMPOUND_GAS_COST_USD = config.DEFAULT_GAS_COST_USD;
-
-    // Warning Thresholds
-    public static readonly RED_ALERT_BREAKEVEN_DAYS = 30;
-    public static readonly HIGH_VOLATILITY_FACTOR = 2;
-    public static readonly DRIFT_WARNING_PCT = 80;
 
     /**
      * Analyze Strategy Drift
@@ -63,7 +40,7 @@ export class RiskManager {
 
         // 1. Portfolio Drift Analysis
         const overlapPct = this.calculateDrift(state.tickLower, state.tickUpper, bb.tickLower, bb.tickUpper);
-        const driftWarning = overlapPct < this.DRIFT_WARNING_PCT;
+        const driftWarning = overlapPct < config.DRIFT_WARNING_PCT;
 
         // 2. EOQ Compounding Logic
         // Threshold = sqrt(2 * P * G * Fee_Rate_24h) -> approximation
@@ -96,11 +73,10 @@ export class RiskManager {
 
         // 5. Key Alerts
         // "IL Breakeven Days > 30 天" = RED_ALERT
-        const redAlert = ilBreakevenDays > this.RED_ALERT_BREAKEVEN_DAYS;
+        const redAlert = ilBreakevenDays > config.RED_ALERT_BREAKEVEN_DAYS;
 
         // "Bandwidth > 2x 30D Avg" = HIGH_VOLATILITY_AVOID
-        // Using simple current vs avg comparison
-        const highVolatilityAvoid = currentBandwidth > this.HIGH_VOLATILITY_FACTOR * avg30DBandwidth;
+        const highVolatilityAvoid = currentBandwidth > config.HIGH_VOLATILITY_FACTOR * avg30DBandwidth;
 
         return {
             driftOverlapPct: overlapPct,
