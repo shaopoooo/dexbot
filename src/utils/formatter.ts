@@ -141,10 +141,32 @@ export function buildTelegramPositionBlock(
     return block;
 }
 
+function toCST(d: Date): { date: string; hh: string; mm: string } {
+    const cst = new Date(d.getTime() + 8 * 3600_000);
+    return {
+        date: cst.toISOString().slice(0, 10),
+        hh:   String(cst.getUTCHours()).padStart(2, '0'),
+        mm:   String(cst.getUTCMinutes()).padStart(2, '0'),
+    };
+}
+
+/** Build the snapshot header line (with optional price row) for positions.log. */
+export function buildLogSnapshotHeader(bb?: BBResult | null, kLow?: number, kHigh?: number): string {
+    const now = new Date();
+    const { date, hh, mm } = toCST(now);
+    const timestamp = `${date} ${hh}:${mm} UTC+8`;
+    const header = `═══ [${timestamp}] Snapshot ═══`;
+    if (!bb) return header;
+    const prices = `  ETH $${bb.ethPrice.toFixed(0)}  BTC $${bb.cbbtcPrice.toFixed(0)}  CAKE $${bb.cakePrice.toFixed(3)}  AERO $${bb.aeroPrice.toFixed(3)}`;
+    const kStr = (kLow !== undefined && kHigh !== undefined) ? `  k=${kLow}/${kHigh}` : '';
+    return header + '\n' + prices + kStr;
+}
+
 /** Format a single position as a plain-text block for positions.log. */
 export function buildLogPositionBlock(pos: PositionRecord, tokenDecimals: Record<string, number>, bb?: BBResult | null): string {
     const now = new Date();
-    const timeStr = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+    const { hh, mm } = toCST(now);
+    const timeStr = `${hh}:${mm}`;
     const label = `${pos.dex} ${(pos.feeTier * 100).toFixed(4).replace(/\.?0+$/, '')}%`;
     const walletShort = pos.ownerWallet
         ? `${pos.ownerWallet.slice(0, 6)}...${pos.ownerWallet.slice(-4)}`
@@ -196,10 +218,11 @@ export function buildLogPositionBlock(pos: PositionRecord, tokenDecimals: Record
     if (t0line) lines.push(`     ${t0line}`);
     if (t1line) lines.push(`     ${t1line}`);
     if (t2line) lines.push(`     ${t2line}`);
-    if (pos.overlapPercent < config.DRIFT_WARNING_PCT) {
+    const bbReady = !!(pos.bbMinPrice && pos.bbMaxPrice);
+    if (bbReady && pos.overlapPercent < config.DRIFT_WARNING_PCT) {
         lines.push(`  [!] DRIFT WARNING: overlap ${pos.overlapPercent.toFixed(1)}% < ${config.DRIFT_WARNING_PCT}%`);
     }
-    if (pos.rebalance) {
+    if (bbReady && pos.rebalance) {
         const rb = pos.rebalance;
         const strategy = REBALANCE_STRATEGY[rb.recommendedStrategy] ?? rb.recommendedStrategy;
         lines.push(`  [!] REBALANCE: ${strategy} (drift ${rb.driftPercent > 0 ? '+' : ''}${rb.driftPercent.toFixed(1)}%)`);

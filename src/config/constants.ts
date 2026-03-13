@@ -55,10 +55,10 @@ export const constants = {
     COLLECTED_FEES_CHUNK_DELAY_MS: 200,  // 500-block chunk 數量增加，delay 略拉長降低 rate-limit 風險
 
     // ── BB Engine Parameters ──────────────────────────────────────────────
-    BB_K_LOW_VOL: 1.5,   // 震盪市 (vol < threshold)
-    BB_K_HIGH_VOL: 2.0,   // 趨勢市 (vol >= threshold)
+    BB_K_LOW_VOL: 1.8,   // 震盪市 (vol < threshold)
+    BB_K_HIGH_VOL: 2.5,   // 趨勢市 (vol >= threshold)
     BB_VOL_THRESHOLD: 0.50,  // 年化波動率分界
-    BB_MAX_OFFSET_PCT: 0.10, // 帶寬上限 ±10%
+    BB_MAX_OFFSET_PCT: 0.15, // 帶寬上限 ±10%
     BB_HOURLY_WINDOW: 20,    // getPrices 最後 N 小時
     BB_FALLBACK_K: 2.0,
     BB_FALLBACK_VOL: 0.5,

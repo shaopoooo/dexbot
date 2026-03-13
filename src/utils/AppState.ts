@@ -6,11 +6,16 @@
  * so it's easy to reason about data ownership and to mock in tests.
  */
 import { PoolStats, PositionRecord, BBResult } from '../types';
+import { config } from '../config';
 
 class AppState {
     pools: PoolStats[] = [];
     positions: PositionRecord[] = [];
     bbs: Record<string, BBResult> = {};
+
+    /** Runtime-adjustable BB k values (default from config, overridable via /bbk) */
+    bbKLowVol: number = config.BB_K_LOW_VOL;
+    bbKHighVol: number = config.BB_K_HIGH_VOL;
 
     readonly lastUpdated = {
         poolScanner:     0,

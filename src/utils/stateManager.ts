@@ -27,6 +27,9 @@ export interface PersistedState {
     intervalMinutes?: number;                               // cron 排程間隔（分鐘）
     sortBy: string;
     bandwidthWindows?: Record<string, number[]>;            // poolAddr → rolling 30D bandwidth window
+    bbKLowVol?: number;                                     // runtime BB k (low vol)
+    bbKHighVol?: number;                                    // runtime BB k (high vol)
+    closedTokenIds?: string[];                              // liquidity=0 confirmed, skip forever
     // 已探索的倉位清單（跳過 syncFromChain）
     discoveredPositions?: DiscoveredPosition[];
     syncedWallets?: string[];   // 當時掃描的 wallet 列表，用於判斷配置是否變更
@@ -55,6 +58,9 @@ export async function saveState(
     syncedWallets?: string[],
     bandwidthWindows?: Record<string, number[]>,
     intervalMinutes?: number,
+    bbKLowVol?: number,
+    bbKHighVol?: number,
+    closedTokenIds?: string[],
 ): Promise<void> {
     try {
         await fs.ensureDir(path.dirname(STATE_FILE));
@@ -66,6 +72,9 @@ export async function saveState(
             intervalMinutes,
             sortBy,
             bandwidthWindows,
+            bbKLowVol,
+            bbKHighVol,
+            closedTokenIds,
             discoveredPositions,
             syncedWallets,
         };

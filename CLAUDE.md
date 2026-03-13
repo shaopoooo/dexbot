@@ -60,13 +60,28 @@ config/
 - `tickToPrice` → `src/utils/math.ts`；token decimal / symbol 推斷 → `src/utils/tokenInfo.ts`；Wallet 正則 → `src/utils/validation.ts`
 - 新增工具函式後，**所有**使用舊版 inline 實作的地方必須一併改用新版，不允許新舊並存
 
-**文件同步（CLAUDE.md 維護）**
-- **每次變更程式邏輯後，必須同步更新 CLAUDE.md**：包含目錄結構、核心資料流、模組說明、任務清單
-- 新增檔案 → 更新目錄結構；Pipeline 變更 → 更新核心資料流；Bug 修正或功能完成 → 對應任務清單標記 `[x]`
-- 禁止讓 CLAUDE.md 與程式碼實際狀態脫節
+**文件職責分工**
+
+| 內容類型 | 主要文件 | 另一份文件的處理方式 |
+|----------|----------|----------------------|
+| 環境變數完整說明 | `README.md` | CLAUDE.md 只列變數名，不重複說明 |
+| 監測池清單與地址 | `README.md` | CLAUDE.md 引用 `config.POOL_SCAN_LIST` |
+| Telegram 指令完整說明 | `README.md` | CLAUDE.md 只列指令名稱 |
+| 狀態持久化 schema | `README.md` | CLAUDE.md 模組描述只提欄位名 |
+| 部署 / Docker / Railway | `README.md` | 不在 CLAUDE.md |
+| 程式架構、模組職責、資料流 | `CLAUDE.md` | README.md 保留高階一行說明 |
+| Telegram 報告欄位邏輯 | `CLAUDE.md` | README.md 保留完整格式範例 |
+| 任務清單 | `CLAUDE.md` | 不在 README.md |
+
+**文件同步規則**
+- **每次變更程式邏輯後，必須同步更新 CLAUDE.md 與 README.md**
+- CLAUDE.md：更新目錄結構、核心資料流、模組說明、任務清單
+- README.md：更新環境變數、Telegram 指令、state.json schema、BBEngine 參數等使用者可感知的內容
+- 新增功能 → 兩份文件都要反映；Bug 修正 → CLAUDE.md 任務清單 `[x]`；若有使用者可見變化（指令、格式、env var）→ README.md 一起更新
+- 禁止兩份文件出現相互矛盾的說明；主要文件先更新，另一份對應簡化
 
 **部署文件**
-- `README.md`：清楚列出所有環境變數及說明
+- `README.md`：清楚列出所有環境變數及說明（單一來源）
 - `Dockerfile`：包含 Railway 部署設定指南
 
 ---
@@ -107,8 +122,9 @@ src/
     ├── stateManager.ts         # 跨重啟狀態持久化（讀寫 data/state.json）
     ├── BandwidthTracker.ts     # 30D 帶寬滾動窗口（update / snapshot / restore）
     ├── tokenPrices.ts          # 幣價快取（WETH / cbBTC / CAKE / AERO，2 分鐘 TTL）
-    ├── AppState.ts             # 全域共享狀態單例（pools / positions / bbs / lastUpdated）
-    └── tokenInfo.ts            # Token 元資料（getTokenDecimals / getTokenSymbol / TOKEN_DECIMALS）
+    ├── AppState.ts             # 全域共享狀態單例（pools / positions / bbs / lastUpdated / bbKLowVol / bbKHighVol）
+    ├── tokenInfo.ts            # Token 元資料（getTokenDecimals / getTokenSymbol / TOKEN_DECIMALS）
+    └── formatter.ts            # 文字格式化工具（compactAmount、formatPositionLog，TelegramBot 與 logger 共用）
 ```
 
 ### 核心資料流
@@ -144,16 +160,8 @@ appState.lastUpdated.* ← 各 runner 寫入時間戳
 
 - **資料來源**：DexScreener（TVL）→ GeckoTerminal（所有池子，The Graph subgraph 已停用）
 - **APR 公式**：`APR = (24h 手續費 / TVL) × 365`，24h 手續費 = 7D 加權均量 × 費率
-- **池清單**：由 `config.POOL_SCAN_LIST`（`constants.ts`）統一定義，新增池子只需改此處
+- **池清單**：由 `config.POOL_SCAN_LIST`（`constants.ts`）統一定義，新增池子只需改此處；完整地址見 README.md
 - **關鍵函式**：`scanAllCorePools()` → `fetchPoolStats()` → `fetchPoolVolume()`
-
-| 協議 | 費率 | 合約地址 |
-|------|------|----------|
-| PancakeSwap V3 | 0.01% | `0xC211e1f853A898Bd1302385CCdE55f33a8C4B3f3` |
-| PancakeSwap V3 | 0.05% | `0xd974d59e30054cf1abeded0c9947b0d8baf90029` |
-| Uniswap V3 | 0.05% | `0x7aea2e8a3843516afa07293a10ac8e49906dabd1` |
-| Uniswap V3 | 0.30% | `0x8c7080564b5a792a33ef2fd473fba6364d5495e5` |
-| Aerodrome Slipstream | 0.0085% | `0x22aee3699b6a0fed71490c103bd4e5f3309891d5` |
 
 ### BBEngine（`src/services/BBEngine.ts`）
 
@@ -162,12 +170,8 @@ appState.lastUpdated.* ← 各 runner 寫入時間戳
 - **Tick 計算方式**：直接由 SMA price 換算 tick（`tick = log(price) / log(1.0001)`），不再以 currentTick ± offset 計算；同一池子所有倉位週期內看到相同 BB，不受市價微動影響
 - **下界保護**：`lowerPrice = max(sma - maxOffset, sma - k × stdDev)`，`maxOffset = sma × 10%`，禁止使用絕對數值夾值
 - **幣價快取**：同時取得 WETH / cbBTC / CAKE / AERO 四個價格（DexScreener，2 分鐘 TTL），存入 `BBResult`
+- **k 值**：`appState.bbKLowVol`（震盪市）/ `appState.bbKHighVol`（趨勢市），預設讀 `config.BB_K_LOW_VOL / BB_K_HIGH_VOL`，可透過 `/bbk` 即時調整；完整說明見 README.md
 - **關鍵函式**：`computeDynamicBB()` — 計算上下界 Tick 與價格
-
-| 市場狀態 | 條件 | k 值 |
-|----------|------|------|
-| 震盪市 | 30D 年化波動率 < 50% | `k = 1.5` |
-| 趨勢市 | 30D 年化波動率 ≥ 50% | `k = 2.0` |
 
 ### ChainEventScanner（`src/services/ChainEventScanner.ts`）
 
@@ -182,16 +186,17 @@ appState.lastUpdated.* ← 各 runner 寫入時間戳
 - **職責**：狀態管理、倉位發現、鏈上原始資料讀取（→ `RawChainPosition[]`）、timestamp 補齊；不直接計算 IL / PNL / Risk
 - **多錢包支援**：`WALLET_ADDRESS_1`、`WALLET_ADDRESS_2`... 環境變數，支援動態新增
 - **Gauge 鎖倉**：`TRACKED_TOKEN_<tokenId>=<DEX>` 手動追蹤質押倉位；`isStaked` 欄位自動偵測（ownerOf 回傳非已知錢包 → staked）；`depositorWallet` 追蹤實際持有者
+- **關閉倉位自動剔除**：`updatePositions()` 確認 `liquidity=0` 時，將 tokenId 加入 `closedTokenIds` Set 並從 `this.positions` 移除；`syncFromChain` 和 `restoreDiscoveredPositions` 均跳過 closedTokenIds；持久化至 `state.json`，重啟後不重新掃描（避免已關倉的 NFT 每週期浪費 RPC）
 - **Drift 門檻**：實際區間與 BB 區間重合度 < 80% 時推播 `STRATEGY_DRIFT_WARNING`
 - **手續費計算**：委託 `FeeCalculator`（見下方），PositionScanner 不直接呼叫合約計算費用
 - **timestamp 失敗保護**：`timestampFailures` Map 記錄各 tokenId 失敗次數；超過 `config.TIMESTAMP_MAX_FAILURES`（= 3）後寫入 `openTimestampMs = -1`（顯示 N/A），停止重試
 - **注意**：Aerodrome `positions()` 第 5 欄回傳 `tickSpacing`（非 fee pips）
-- **關鍵函式**：`fetchAll()` / `updatePositions()` / `syncFromChain(skipTimestampScan?)` / `fillMissingTimestamps()` / `restoreDiscoveredPositions()` / `getDiscoveredSnapshot()`
+- **關鍵函式**：`fetchAll()` / `updatePositions()` / `syncFromChain(skipTimestampScan?)` / `fillMissingTimestamps()` / `restoreDiscoveredPositions()` / `getDiscoveredSnapshot()` / `getClosedSnapshot()` / `restoreClosedTokenIds()`
 
 ### FeeCalculator（`src/services/FeeCalculator.ts`）
 
 - **職責**：純 RPC 手續費計算，與 PositionScanner 解耦
-- **Aerodrome staked fallback 鏈**：`voter.gauges()` → `gauge.pendingFees(tokenId)` → `collect.staticCall({from: gauge})` → **`computePendingFees()`（pool feeGrowth 數學計算）** → `tokensOwed`
+- **Aerodrome staked fallback 鏈**：`voter.gauges()` → `gauge.pendingFees(tokenId)` → `collect.staticCall({from: gauge})` → `tokensOwed`（第 3 級 `computePendingFees()` 暫時停用：`0x22AEe369` pool 在公共節點不支援 `feeGrowthGlobal` / `ticks()`，CALL_EXCEPTION 每次浪費 6+ 次 retry）
 - **Aerodrome unstaked**：`computePendingFees()`（pool feeGrowth 數學計算）
 - **Uniswap / PancakeSwap**：`collect.staticCall({ from: owner })`，最終 fallback `tokensOwed0/1`
 - **第三幣獎勵**：PancakeSwap staked → `masterchef.pendingCake(tokenId)`；Aerodrome staked → `gauge.earned(depositorWallet, tokenId)`
@@ -240,63 +245,32 @@ EOQ Threshold    = sqrt(2 × P × G × Fee_Rate_24h)
 - **`compactAmount(n)`**：將極小數字轉為下標零表示法（如 `0.0002719` → `0.0₃2719`），Telegram 與 positions.log 共用同一邏輯
 - **淨損益 vs 無常損失**：`💸 淨損益` = LP現值 + Unclaimed - 本金（含手續費）；`無常損失` = LP現值 - 本金（純市價波動）
 - **鎖倉 icon**：`isStaked = true` 的倉位在 tokenId 後顯示 `🔒`
+- **BB k 值顯示**：報告底部顯示目前 `k_low / k_high`（`appState.bbKLowVol / bbKHighVol`）
 
-```
-[2026-03-07 10:00] 倉位監控報告 (2 個倉位 | 排序: 倉位大小 ↓)
+**指令**：`/help` / `/sort <key>` / `/interval <分鐘>` / `/bbk [low high]` / `/explain`；完整說明見 README.md
 
-📊 總覽  2 倉位 · 2 錢包
-💼 總倉位 $20,200  |  本金 $18,000  |  Unclaimed $6.7
-💱 ETH $2,053  BTC $70,387  CAKE $1.380  AERO $0.324
-💰 總獲利 +$276.8 (+1.38%) 🟢
+**報告欄位邏輯（實作參考）：**
 
-━━ #1 PancakeSwap 0.01% ━━
-👛 0xabc...1234 · #1675918
-⏳ 開倉 3天2小時
-💹 當前 0.02921 | Low Vol (震盪市)
- ├ 你的 0.02803 ~ 0.03054
- └ 建議 0.02628 ~ 0.03213
-💼 倉位 $1,987 | 本金 $2,000 | 健康 94/100
-⌛  Breakeven 盈利中 · 獲利 +1.82%
-💸 淨損益 +$18.2 🟢 | 無常損失 -$13.0 🔴
-🔄 未領取手續費 $4.62 ✅ > $0.1
-     0.0₃2719 WETH ($0.56)
-     0.0₅774 cbBTC ($0.54)
+- `💱` 幣價行：`getTokenPrices()` 提供，不依賴 BBResult
+- `⏳ 開倉`：需 `openTimestampMs > 0`；`· 獲利 +X%` 需 `initialCapital != null`
+- `💼 倉位`：`positionValueUSD`；`本金`：`initialCapital ?? N/A`；`健康`：`healthScore/100`
+- `⌛ Breakeven`：`ilUSD >= 0` → 顯示「盈利中」；否則顯示 `breakevenDays` 天數
+- `💸 淨損益`：`ilUSD`（LP現值 + Unclaimed - 本金）；`無常損失`：`positionValueUSD - initialCapital`
+- `🔄 未領取`：`unclaimedFeesUSD`；`✅/❌` 比較 `compoundThreshold`；逐幣明細各幣 > 0 才顯示
+- `🔒`：`isStaked = true`
+- `⚠️ RED_ALERT`：`breakevenDays > config.RED_ALERT_BREAKEVEN_DAYS`
+- `⚠️ HIGH_VOLATILITY_AVOID`：`currentBandwidth > avg30D × config.HIGH_VOLATILITY_FACTOR`
+- `⚠️ DRIFT`：`overlapPercent < config.DRIFT_WARNING_PCT`；附 `rebalance.strategyName`
+- 底部：`📐 BB k: low=X  high=X`（`appState.bbKLowVol / bbKHighVol`）
 
-━━ #2 Aerodrome 0.0085% ━━
-👛 0xdef...5678 · #56328282 🔒
-⏳ 開倉 1天0小時
-💹 當前 0.02905 | High Vol (趨勢市)
- ├ 你的 0.02700 ~ 0.03100
- └ 建議 0.02550 ~ 0.03300
-💼 倉位 $7,800 | 本金 $8,000 | 健康 61/100
-⌛  Breakeven 22天
-💸 淨損益 -$95.0 🔴
-🔄 未領取手續費 $2.10 ❌ < $5.8
-⚠️ DRIFT 重疊 71.3% (建議依 BB 重建倉)
+完整格式範例見 README.md。
 
-📊 各池收益排行:
-🥇 PancakeSwap 0.01% — APR 67.2% | TVL $1,234K ◀ 你的倉位
-🥈 Aerodrome 0.0085% — APR 29.4% | TVL $987K ◀ 你的倉位
-🥉 Uniswap 0.05% — APR 18.6% | TVL $543K
+### 環境變數
 
-⌛ 資料更新時間:
-- Pool: 10:00 | Position: 10:00
-- BB Engine: 10:00 | Risk: 10:00
-```
-
-排序指令：`/sort size`、`/sort apr`、`/sort unclaimed`、`/sort health`
-
-### 環境變數（`.env`）
-
-| 變數 | 說明 |
-|------|------|
-| `WALLET_ADDRESS_1`、`WALLET_ADDRESS_2`... | 監控錢包地址（逐號新增） |
-| `RPC_URL` | Base 主 RPC |
-| `SUBGRAPH_API_KEY` | The Graph API Key |
-| `BOT_TOKEN` | Telegram Bot Token |
-| `CHAT_ID` | Telegram Chat ID |
-| `INITIAL_INVESTMENT_<tokenId>` | 各倉位初始本金 USD |
-| `TRACKED_TOKEN_<tokenId>` | 手動追蹤鎖倉倉位，值為 DEX 名稱 |
+完整說明與 `.env` 範例見 **README.md**。Claude 在讀寫環境變數時需注意的關鍵命名：
+- `WALLET_ADDRESS_N`：多錢包依序編號
+- `INITIAL_INVESTMENT_<tokenId>`：本金設定，影響 PnL / 獲利率顯示
+- `TRACKED_TOKEN_<tokenId>=<DEX>`：鎖倉倉位手動追蹤
 
 ---
 
@@ -572,6 +546,9 @@ index.ts runRiskManager()
 
 - [x] **RiskManager 魔術數字集中至 config**：`RiskManager.ts` 自定義 `static readonly DRIFT_WARNING_PCT = 80` 與 `RED_ALERT_BREAKEVEN_DAYS = 30`，與 `config.DRIFT_WARNING_PCT` 形成兩個真理來源；全數移至 `constants.ts`（新增 `RED_ALERT_BREAKEVEN_DAYS`、`HIGH_VOLATILITY_FACTOR`），`RiskManager` 改讀 `config.*`，移除所有 `static readonly` 常數
 - [x] **formatPositionLog 提煉至 `formatter.ts`**：`PositionScanner.ts` 塞了近 100 行 `formatPositionLog` / `formatTokenCompact`（下標零、對齊、compactAmount）；Scanner 職責是鏈上資料抓取，不該含 UI 排版；提煉至 `src/utils/formatter.ts`，`TelegramBot` 與 console logger 共用同一套工具
+- [x] **Telegram /bbk 指令**：`AppState` 新增 `bbKLowVol / bbKHighVol`（預設讀 config）；`BBEngine.computeDynamicBB` 改讀 `appState` 而非 `config`；`/bbk <low> <high>` 指令透過 `setBbkCallback` 更新 AppState 並持久化至 `state.json`；positions.log 標頭與 Telegram 報告底部均顯示目前 k 值
+- [x] **Telegram /help 指令**：新增 `/help` 列出所有指令（sort / interval / bbk / explain）；更新 `/explain` 補充 BB k 值、再平衡策略、獲利率公式說明
+- [x] **關閉倉位自動剔除**：`updatePositions()` 偵測 `liquidity=0` 時加入 `closedTokenIds` Set 並移除追蹤；`syncFromChain` / `restoreDiscoveredPositions` 跳過已關閉 tokenId；`getClosedSnapshot()` / `restoreClosedTokenIds()` 接入 `state.json` 持久化，重啟不重新掃描已關倉 NFT
 
 #### 🟢 低優先（精度地雷，階段十前置）
 

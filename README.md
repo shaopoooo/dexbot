@@ -126,6 +126,8 @@ npm test
 src/
 ├── index.ts                    # 主進入點：cron 排程、服務協調、狀態存取
 ├── dryrun.ts                   # 乾跑測試用（不啟動 Telegram）
+├── types/
+│   └── index.ts                # 共用型別定義（PositionRecord、BBResult、RiskAnalysis 等）
 ├── config/
 │   ├── env.ts                  # 環境變數讀取（process.env）
 │   ├── constants.ts            # 常數（池地址、快取 TTL、BB 參數、EWMA、區塊掃描、Gas）
@@ -135,7 +137,9 @@ src/
 │   ├── PoolScanner.ts          # APR 掃描（DexScreener + GeckoTerminal）
 │   ├── BBEngine.ts             # 動態布林通道（20 SMA + EWMA stdDev + 30D 波動率）
 │   ├── ChainEventScanner.ts    # 通用鏈上事件掃描器（ScanHandler 介面 + OpenTimestampHandler）
-│   ├── PositionScanner.ts      # LP NFT 倉位監測（On-chain RPC）
+│   ├── PositionScanner.ts      # LP NFT 倉位監測（狀態管理、倉位發現、鏈上讀取）
+│   ├── FeeCalculator.ts        # 手續費計算（Uniswap / PancakeSwap / Aerodrome 三路 + 第三幣獎勵）
+│   ├── PositionAggregator.ts   # 倉位組裝 Pipeline（RawChainPosition → PositionRecord）
 │   ├── RiskManager.ts          # 風險評估（Health Score、IL Breakeven、EOQ 複利訊號）
 │   ├── PnlCalculator.ts        # 絕對 PNL、開倉資訊、組合總覽計算
 │   └── rebalance.ts            # 再平衡建議（純計算，不執行交易）
@@ -148,9 +152,14 @@ src/
 └── utils/
     ├── logger.ts               # Winston 彩色 logger（console + 檔案輪轉）
     ├── math.ts                 # BigInt 固定精度數學工具
+    ├── formatter.ts            # 文字格式化工具（compactAmount、formatPositionLog）
     ├── rpcProvider.ts          # FallbackProvider + rpcRetry + fetchGasCostUSD()
     ├── cache.ts                # LRU 快取實例（bbVolCache、poolVolCache）+ snapshot/restore 工具
-    └── stateManager.ts         # 跨重啟狀態持久化（讀寫 data/state.json）
+    ├── stateManager.ts         # 跨重啟狀態持久化（讀寫 data/state.json）
+    ├── BandwidthTracker.ts     # 30D 帶寬滾動窗口（update / snapshot / restore）
+    ├── tokenPrices.ts          # 幣價快取（WETH / cbBTC / CAKE / AERO，2 分鐘 TTL）
+    ├── AppState.ts             # 全域共享狀態單例（pools / positions / bbs / lastUpdated / bbKLowVol / bbKHighVol）
+    └── tokenInfo.ts            # Token 元資料（getTokenDecimals / getTokenSymbol）
 
 data/
 ├── state.json                  # Bot 跨重啟快取（自動生成，首次 cron 週期後建立）
@@ -236,6 +245,7 @@ PoolScanner → BBEngine → PositionScanner → RiskManager → TelegramBot
 ⌛ 資料更新時間:
 - Pool: 10:00 | Position: 10:00
 - BB Engine: 10:00 | Risk: 10:00
+📐 BB k: low=1.8  high=2.5
 ```
 
 **選用欄位（有條件才顯示）：**
@@ -252,13 +262,15 @@ PoolScanner → BBEngine → PositionScanner → RiskManager → TelegramBot
 
 | 指令 | 說明 |
 |------|------|
+| `/help` | 列出所有指令與用法 |
 | `/start` | 啟動 Bot，確認連線正常 |
-| `/sort size` | 依倉位大小（USD）排序（預設） |
-| `/sort apr` | 依 APR 排序 |
-| `/sort unclaimed` | 依未領手續費排序 |
-| `/sort health` | 依 Health Score 排序 |
+| `/sort <key>` | 倉位排序：`size`（預設）/ `apr` / `unclaimed` / `health` |
 | `/sort` | 查看目前排序及所有選項 |
-| `/explain` | 顯示所有指標的計算公式說明 |
+| `/interval <分鐘>` | 設定自動報告間隔（10/20/30/60/120/180/240/360/480/720/1440） |
+| `/interval` | 查看可用間隔選項 |
+| `/bbk` | 查看目前 BB k 值（low / high） |
+| `/bbk <low> <high>` | 調整 BB 帶寬乘數，下個週期生效並持久化（例：`/bbk 1.8 2.5`） |
+| `/explain` | 顯示所有指標的計算公式說明（含 BB k 值、再平衡策略） |
 
 ---
 
@@ -288,7 +300,12 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
   "volCachePool": { "0xpool...": { "daily": 123456, "avg7d": 100000, "source": "GeckoTerminal", "expiresAt": 1700000000000 } },
   "priceBuffer":  { "0xpool...": { "1700000000": 0.02921, "1700003600": 0.02935 } },
   "openTimestamps": { "123456_PancakeSwap": 1699000000000 },
+  "bandwidthWindows": { "0xpool...": [0.00123, 0.00145, 0.00132] },
   "sortBy": "size",
+  "intervalMinutes": 10,
+  "bbKLowVol": 1.8,
+  "bbKHighVol": 2.5,
+  "closedTokenIds": ["1675918"],
   "discoveredPositions": [
     { "tokenId": "123456", "dex": "PancakeSwap", "ownerWallet": "0x..." }
   ],
@@ -304,7 +321,11 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
 | `volCachePool` | 30 分鐘 | PoolScanner 每次計算後 | `PoolScanner.ts` |
 | `priceBuffer` | 永久（滾動保留最近 24 筆） | 每次 tick 更新時 | `BBEngine.ts` |
 | `openTimestamps` | 永久 | 首次發現倉位時 | `ChainEventScanner.ts` |
+| `bandwidthWindows` | 永久（滾動保留最近 8640 筆） | 每次 5 分鐘週期 | `BandwidthTracker.ts` |
 | `sortBy` | 永久 | `/sort` 指令觸發時 | `TelegramBot.ts` |
+| `intervalMinutes` | 永久 | `/interval` 指令觸發時 | `TelegramBot.ts` |
+| `bbKLowVol` / `bbKHighVol` | 永久 | `/bbk` 指令觸發時 | `TelegramBot.ts` |
+| `closedTokenIds` | 永久 | 偵測到 `liquidity=0` 時自動加入 | `PositionScanner.ts` |
 | `discoveredPositions` | 永久 | 每次 5 分鐘週期 | `PositionScanner.ts` |
 | `syncedWallets` | 永久 | 每次 5 分鐘週期 | `index.ts` |
 
@@ -355,10 +376,12 @@ Bot 每次 5 分鐘 cron 週期結束後，將以下資料序列化至 `data/sta
 
 ## 動態布林通道（BBEngine）
 
-| 市場狀態 | 條件 | k 值 |
-|----------|------|------|
-| 低波動 | 30D 年化波動率 < 50% | `k = 1.5` |
-| 高波動 | 30D 年化波動率 >= 50% | `k = 2.0` |
+| 市場狀態 | 條件 | 預設 k 值 |
+|----------|------|-----------|
+| 低波動（震盪市） | 30D 年化波動率 < 50% | `k = 1.5`（`BB_K_LOW_VOL`） |
+| 高波動（趨勢市） | 30D 年化波動率 ≥ 50% | `k = 2.0`（`BB_K_HIGH_VOL`） |
+
+k 值可透過 Telegram `/bbk <low> <high>` 指令即時調整，重啟後從 `state.json` 恢復。
 
 價格區間上限為 SMA ±10%（`maxOffset = sma * 0.10`）。stdDev 在資料 ≥ 5 筆時使用 EWMA（α=0.3, β=0.7）平滑計算；不足時由 30D 年化波動率換算 1H stdDev（`sma × vol / √8760`）。
 

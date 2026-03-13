@@ -14,21 +14,21 @@ export interface PoolStats {
 }
 
 export interface BBResult {
-  sma: number;
-  upperPrice: number;
-  lowerPrice: number;
-  k: number;
-  volatility30D: number;
-  tickLower: number;
-  tickUpper: number;
-  ethPrice: number;
-  cbbtcPrice: number;
-  cakePrice: number;
-  aeroPrice: number;
-  minPriceRatio: number;
-  maxPriceRatio: number;
-  isFallback?: boolean;
-  regime: string;
+    sma: number;
+    upperPrice: number;
+    lowerPrice: number;
+    k: number;
+    volatility30D: number;
+    tickLower: number;
+    tickUpper: number;
+    ethPrice: number;
+    cbbtcPrice: number;
+    cakePrice: number;
+    aeroPrice: number;
+    minPriceRatio: number;
+    maxPriceRatio: number;
+    isFallback?: boolean;
+    regime: string;
 }
 
 export interface PositionState {

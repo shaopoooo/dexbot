@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { config } from '../config';
-import { buildLogPositionBlock } from '../utils/formatter';
+import { buildLogPositionBlock, buildLogSnapshotHeader } from '../utils/formatter';
 import { BBResult, RawChainPosition } from '../types';
 import { createServiceLogger, positionLogger } from '../utils/logger';
 import { rpcRetry, nextProvider } from '../utils/rpcProvider';
@@ -20,6 +20,8 @@ export class PositionScanner {
     /** In-memory position store */
     private static positions: PositionRecord[] = [];
     private static syncedWallets = new Set<string>();
+    /** 已確認關閉（liquidity=0）的 tokenId，持久化後跨重啟跳過掃描 */
+    private static closedTokenIds = new Set<string>();
     /** 各 tokenId 的 timestamp 查詢失敗次數；超過上限後停止重試，顯示 N/A */
     private static timestampFailures = new Map<string, number>();
 
@@ -31,7 +33,8 @@ export class PositionScanner {
         wallets: string[],
         timestamps: Record<string, number>
     ) {
-        const seedPositions: PositionRecord[] = discovered.map(d => ({
+        const activeDiscovered = discovered.filter(d => !this.closedTokenIds.has(d.tokenId));
+        const seedPositions: PositionRecord[] = activeDiscovered.map(d => ({
             tokenId: d.tokenId,
             dex: d.dex,
             poolAddress: '',
@@ -77,6 +80,17 @@ export class PositionScanner {
         return this.positions.map(p => ({ tokenId: p.tokenId, dex: p.dex, ownerWallet: p.ownerWallet }));
     }
 
+    /** 取得已關閉 tokenId 清單快照，供 stateManager 持久化。 */
+    static getClosedSnapshot(): string[] {
+        return [...this.closedTokenIds];
+    }
+
+    /** 從 state 恢復已關閉的 tokenId 集合。 */
+    static restoreClosedTokenIds(ids: string[]) {
+        ids.forEach(id => this.closedTokenIds.add(id));
+        if (ids.length > 0) log.info(`💾 closed positions restored: ${ids.join(', ')}`);
+    }
+
     static async syncFromChain(skipTimestampScan = false) {
         if (config.WALLET_ADDRESSES.length === 0) {
             log.info('no wallets configured, skipping chain sync');
@@ -109,6 +123,10 @@ export class PositionScanner {
                             `${dex}.tokenOfOwnerByIndex(${i})`
                         );
                         const tokenIdStr = tokenId.toString();
+                        if (this.closedTokenIds.has(tokenIdStr)) {
+                            log.info(`  → #${tokenIdStr} (skipped — closed)`);
+                            continue;
+                        }
                         log.info(`  → #${tokenIdStr}`);
                         discovered.push({ tokenId: tokenIdStr, dex, ownerWallet: walletAddress });
                     }
@@ -137,7 +155,8 @@ export class PositionScanner {
             log.info(`⏭  timestamp lookup deferred to fillMissingTimestamps()`);
         }
 
-        const seedPositions: PositionRecord[] = discovered.map(d => ({
+        const activeDiscovered = discovered.filter(d => !this.closedTokenIds.has(d.tokenId));
+        const seedPositions: PositionRecord[] = activeDiscovered.map(d => ({
             tokenId: d.tokenId,
             dex: d.dex,
             poolAddress: '',
@@ -219,27 +238,32 @@ export class PositionScanner {
      */
     static updatePositions(assembled: PositionRecord[]) {
         const assembledMap = new Map(assembled.map(p => [p.tokenId, p]));
-        this.positions = this.positions.map(prev => {
+        const updated: PositionRecord[] = [];
+        for (const prev of this.positions) {
             const fresh = assembledMap.get(prev.tokenId);
             if (!fresh) {
                 log.warn(`#${prev.tokenId} not in assembled batch, keeping stale record`);
-                return prev;
+                updated.push(prev);
+                continue;
             }
             if (Number(fresh.liquidity) === 0) {
-                log.warn(`#${prev.tokenId} on-chain liquidity=0 — position may be closed`);
+                this.closedTokenIds.add(prev.tokenId);
+                log.info(`#${prev.tokenId} liquidity=0 — marked closed, removed from tracking`);
+                continue; // drop from positions, will not be scanned again
             }
             const isKnownWallet = config.WALLET_ADDRESSES.some(
                 w => w.toLowerCase() === fresh.ownerWallet.toLowerCase()
             );
             const ownerWallet = isKnownWallet ? fresh.ownerWallet : prev.ownerWallet;
-            return {
+            updated.push({
                 ...prev,
                 ...fresh,
                 ownerWallet,
                 openTimestampMs: fresh.openTimestampMs ?? prev.openTimestampMs,
                 lastUpdated: Date.now(),
-            };
-        });
+            });
+        }
+        this.positions = updated;
         log.info(`✅ ${assembled.length} position(s) refreshed`);
     }
 
@@ -247,16 +271,17 @@ export class PositionScanner {
      * Optional: Generate a text report of positions to a log file.
      * Call this at the end of the analysis pipeline.
      */
-    static logSnapshots(positions: PositionRecord[], bb?: BBResult | null) {
+    static logSnapshots(positions: PositionRecord[], bb?: BBResult | null, kLow?: number, kHigh?: number) {
         if (positions.length === 0) return;
         const outputs = positions.map(pos => buildLogPositionBlock(pos, TOKEN_DECIMALS, bb));
 
-        const logContent = outputs.join('\n\n') + '\n\n';
+        const header = buildLogSnapshotHeader(bb, kLow, kHigh);
+        const logContent = header + '\n\n' + outputs.join('\n\n') + '\n\n';
 
         const logDir = path.join(__dirname, '../../logs');
         fs.ensureDirSync(logDir);
-        fs.writeFileSync(path.join(logDir, 'positions.log'), logContent);
-        log.info(`✅ report sent  ${positions.length} position(s)`);
+        fs.appendFileSync(path.join(logDir, 'positions.log'), logContent);
+        log.info(`✅ positions.log written  ${positions.length} position(s)`);
     }
 
     /**

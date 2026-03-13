@@ -70,7 +70,9 @@ export class RebalanceService {
         positionValueUSD: number,
         token0Symbol: string,
         token1Symbol: string,
-        gasCostUSD?: number
+        gasCostUSD?: number,
+        bbLowerAdj?: number,   // decimal-adjusted lower BB price (pos.bbMinPrice)
+        bbUpperAdj?: number,   // decimal-adjusted upper BB price (pos.bbMaxPrice)
     ): RebalanceSuggestion | null {
         try {
             const gasCost = gasCostUSD ?? config.REBALANCE_GAS_COST_USD;
@@ -81,16 +83,21 @@ export class RebalanceService {
             const sdOffset = 0.3 * sd * (currentPrice > currentBB.sma ? 1 : -1);
 
             // 步驟 1: 計算超出百分比 (driftPercent)
+            // 使用 decimal-adjusted 的 BB 邊界（與 currentPrice 同單位），
+            // 避免與 BBResult.upperPrice/lowerPrice（raw tick-ratio）或 minPriceRatio/maxPriceRatio（USD）混用。
+            const bbLower = bbLowerAdj ?? 0;
+            const bbUpper = bbUpperAdj ?? 0;
+            if (bbLower === 0 || bbUpper === 0) return null; // BB 尚未就緒
             let driftPercent = 0;
-            if (currentPrice > currentBB.maxPriceRatio) {
-                driftPercent = ((currentPrice - currentBB.maxPriceRatio) / currentBB.maxPriceRatio) * 100;
-            } else if (currentPrice < currentBB.minPriceRatio) {
-                driftPercent = ((currentBB.minPriceRatio - currentPrice) / currentBB.minPriceRatio) * 100 * -1; // 負值表示下超出
+            if (currentPrice > bbUpper) {
+                driftPercent = ((currentPrice - bbUpper) / bbUpper) * 100;
+            } else if (currentPrice < bbLower) {
+                driftPercent = ((bbLower - currentPrice) / bbLower) * 100 * -1;
             }
             if (Math.abs(driftPercent) < config.REBALANCE_DRIFT_MIN_PCT) return null;
 
-            // 步驟 2: 產生新 BB 區間 (不需要重複跑 BBEngine，因為 currentBB 已經包含了基於當前 tick/時間算出的最新點位建議)
-            const newBB = currentBB;
+            // 步驟 2: 產生新 BB 區間 (shallow copy 避免 mutate appState.bbs 裡的 BBResult)
+            const newBB = { ...currentBB };
 
             // 步驟 3: 決定推薦策略 (基於超出程度 + Breakeven + EOQ)
             let recommendedStrategy: RebalanceSuggestion['recommendedStrategy'] = 'wait';

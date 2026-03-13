@@ -4,6 +4,7 @@ import { PoolStats, BBResult, PositionRecord, RiskAnalysis, SortBy } from '../ty
 import { createServiceLogger } from '../utils/logger';
 import { getTokenPrices } from '../utils/tokenPrices';
 import { buildTelegramPositionBlock, fmtInterval } from '../utils/formatter';
+import { appState } from '../utils/AppState';
 
 const log = createServiceLogger('TelegramBot');
 
@@ -22,9 +23,14 @@ export class TelegramBotService {
     private chatId: string;
     private sortBy: SortBy = 'size';
     private onReschedule: ((minutes: number) => void) | null = null;
+    private onBbkChange: ((kLow: number, kHigh: number) => void) | null = null;
 
     setRescheduleCallback(cb: (minutes: number) => void) {
         this.onReschedule = cb;
+    }
+
+    setBbkCallback(cb: (kLow: number, kHigh: number) => void) {
+        this.onBbkChange = cb;
     }
 
     constructor() {
@@ -33,6 +39,32 @@ export class TelegramBotService {
 
         this.bot.command('start', (ctx) => {
             ctx.reply('DexInfoBot started! Monitoring Base network DEX pools...');
+        });
+
+        this.bot.command('help', (ctx) => {
+            const msg =
+                `📋 <b>DexInfoBot 指令說明</b>\n\n` +
+                `<b>📊 報告與排序</b>\n` +
+                `/sort &lt;key&gt; — 設定倉位排序方式\n` +
+                `  · <code>size</code>　倉位大小（預設）\n` +
+                `  · <code>apr</code>　　池子 APR\n` +
+                `  · <code>unclaimed</code> 未領取手續費\n` +
+                `  · <code>health</code>　健康分數\n\n` +
+                `<b>⏱ 排程</b>\n` +
+                `/interval &lt;分鐘&gt; — 設定自動報告間隔\n` +
+                `  可用值: ${VALID_INTERVALS.map(m => fmtInterval(m)).join('、')}\n` +
+                `  範例: <code>/interval 30</code>\n\n` +
+                `<b>📐 BB 布林通道</b>\n` +
+                `/bbk — 查看目前 k 值設定\n` +
+                `/bbk &lt;low&gt; &lt;high&gt; — 調整 BB 帶寬乘數\n` +
+                `  · low：震盪市（Low Vol）用\n` +
+                `  · high：趨勢市（High Vol）用\n` +
+                `  建議範圍 1.0 ~ 3.0，預設 ${config.BB_K_LOW_VOL}/${config.BB_K_HIGH_VOL}\n` +
+                `  範例: <code>/bbk 1.8 2.5</code>\n\n` +
+                `<b>📖 說明</b>\n` +
+                `/explain — 各項指標計算公式詳解\n` +
+                `/help — 顯示本說明`;
+            ctx.reply(msg, { parse_mode: 'HTML' });
         });
 
         this.bot.command('sort', (ctx) => {
@@ -54,29 +86,39 @@ export class TelegramBotService {
         this.bot.command('explain', (ctx) => {
             const msg =
                 `📖 <b>指標計算說明</b>\n\n` +
-                `<b>健康分數</b> (0–100)\n` +
-                `= 50 + (Unclaimed + IL) / 本金 × 1000\n` +
-                `50 = 損益兩平，100 = 盈利 ≥5%\n\n` +
                 `<b>淨損益（PnL）</b>\n` +
                 `= LP現值 + Unclaimed - 初始本金\n` +
-                `正值 🟢 = 盈利，負值 🔴 = 虧損\n` +
-                `（已領取再投入的費用已含於LP現值，不重複計算）\n\n` +
+                `正值 🟢 = 盈利，負值 🔴 = 虧損\n\n` +
                 `<b>無常損失（IL）</b>\n` +
                 `= LP現值 - 初始本金\n` +
-                `純市價波動造成的 LP 倉位變化，不含手續費\n\n` +
+                `純市價波動造成的倉位縮水，不含手續費收益\n\n` +
+                `<b>健康分數</b> (0–100)\n` +
+                `= 50 + (Unclaimed + IL) / 本金 × 1000\n` +
+                `50 = 損益兩平；&gt;50 盈利；&lt;50 虧損\n` +
+                `100 = 報酬率達 +5% 以上\n\n` +
                 `<b>Breakeven 天數</b>\n` +
                 `= |IL| / 每日手續費收入\n` +
-                `代表需幾天費用彌補目前 IL\n\n` +
-                `<b>Compound Threshold</b>\n` +
+                `需幾天費用收益才能彌補目前 IL\n` +
+                `IL ≥ 0 時顯示「盈利中」\n\n` +
+                `<b>Compound Threshold (EOQ)</b>\n` +
                 `= √(2 × 本金 × Gas費 × 24h費率)\n` +
-                `Unclaimed > Threshold → 建議複利\n\n` +
-                `<b>淨 APR</b>\n` +
-                `= 池子費用APR + IL年化率\n` +
-                `IL年化率 = IL / 本金 / 持倉天數 × 365\n` +
-                `需設定建倉本金才會顯示\n\n` +
+                `Unclaimed ✅ &gt; Threshold → 建議複利再投入\n` +
+                `Unclaimed ❌ &lt; Threshold → 繼續等待累積\n\n` +
+                `<b>獲利率</b>\n` +
+                `= (LP現值 + Unclaimed - 本金) / 本金 × 100%\n` +
+                `需設定初始本金（INITIAL_INVESTMENT_&lt;tokenId&gt;）才顯示\n\n` +
+                `<b>布林通道 BB（Bollinger Bands）</b>\n` +
+                `SMA = 最近 20 筆小時 tick 均價\n` +
+                `帶寬 = k × σ（stdDev，EWMA 平滑）\n` +
+                `震盪市（Low Vol）: k_low；趨勢市（High Vol）: k_high\n` +
+                `用 /bbk 調整，目前 k=${appState.bbKLowVol}/${appState.bbKHighVol}\n\n` +
                 `<b>DRIFT 警告</b>\n` +
-                `重疊度 = 倉位落在 BB 內的比例\n` +
-                `&lt; 80% 時觸發，建議重建倉`;
+                `重疊度 = 你的倉位區間落在 BB 內的比例\n` +
+                `&lt; ${config.DRIFT_WARNING_PCT}% 時觸發，建議依 BB 重建倉\n\n` +
+                `<b>再平衡策略</b>\n` +
+                `等待回歸 — 偏離小，無需行動\n` +
+                `DCA 定投 — 偏離中，用手續費補倉\n` +
+                `撤資單邊建倉 — 偏離大，單幣掛單等回歸`;
             ctx.reply(msg, { parse_mode: 'HTML' });
         });
 
@@ -98,6 +140,42 @@ export class TelegramBotService {
                 ctx.reply(`✅ 排程已更新為每 <b>${fmtInterval(min)}</b> 執行一次\n（cron: <code>${minutesToCron(min)}</code>）`, { parse_mode: 'HTML' });
             } else {
                 ctx.reply('❌ 排程功能尚未初始化');
+            }
+        });
+
+        this.bot.command('bbk', (ctx) => {
+            const parts = (ctx.match?.trim() ?? '').split(/\s+/).filter(Boolean);
+            if (parts.length === 0) {
+                const { bbKLowVol, bbKHighVol } = appState;
+                ctx.reply(
+                    `📐 <b>BB k 值設定</b>\n\n` +
+                    `目前: k_low=<b>${bbKLowVol}</b>  k_high=<b>${bbKHighVol}</b>\n\n` +
+                    `用法: <code>/bbk &lt;low&gt; &lt;high&gt;</code>\n` +
+                    `範例: <code>/bbk 1.8 2.5</code>\n\n` +
+                    `震盪市 (Low Vol) 用 k_low，趨勢市 (High Vol) 用 k_high。\n` +
+                    `建議範圍：1.0 ~ 3.0`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+            if (parts.length !== 2) {
+                ctx.reply('❌ 格式錯誤。用法: <code>/bbk &lt;low&gt; &lt;high&gt;</code>', { parse_mode: 'HTML' });
+                return;
+            }
+            const kLow  = parseFloat(parts[0]);
+            const kHigh = parseFloat(parts[1]);
+            if (isNaN(kLow) || isNaN(kHigh) || kLow <= 0 || kHigh <= 0 || kLow > kHigh) {
+                ctx.reply('❌ 數值無效。low 與 high 需為正數且 low ≤ high');
+                return;
+            }
+            if (this.onBbkChange) {
+                this.onBbkChange(kLow, kHigh);
+                ctx.reply(
+                    `✅ BB k 值已更新\nk_low=<b>${kLow}</b>  k_high=<b>${kHigh}</b>\n（下個週期生效）`,
+                    { parse_mode: 'HTML' }
+                );
+            } else {
+                ctx.reply('❌ BBk 功能尚未初始化');
             }
         });
     }
@@ -211,10 +289,11 @@ export class TelegramBotService {
             });
         }
 
-        // 更新時間（顯示一次）
+        // BB k 值與更新時間
         msg += `\n\n⌛ <b>資料更新時間:</b>`;
         msg += `\n- Pool: ${formatTs(lastUpdates.poolScanner)} | Position: ${formatTs(lastUpdates.positionScanner)}`;
         msg += `\n- BB Engine: ${formatTs(lastUpdates.bbEngine)} | Risk: ${formatTs(lastUpdates.riskManager)}`;
+        msg += `\n📐 BB k: low=<b>${appState.bbKLowVol}</b>  high=<b>${appState.bbKHighVol}</b>`;
 
         await this.sendAlert(msg);
     }

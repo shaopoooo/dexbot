@@ -6,6 +6,7 @@ import { geckoRequest } from '../utils/rpcProvider';
 import { config } from '../config';
 import { getTokenPrices } from '../utils/tokenPrices';
 import { BBResult } from '../types';
+import { appState } from '../utils/AppState';
 
 export type { BBResult };
 
@@ -206,7 +207,7 @@ export class BBEngine {
 
       // 2. 先取得 30D 年化波動率（k 值與 stdDev fallback 都需要）
       const annualizedVol = await fetchDailyVol(poolAddress, dex);
-      const k = annualizedVol < config.BB_VOL_THRESHOLD ? config.BB_K_LOW_VOL : config.BB_K_HIGH_VOL;
+      const k = annualizedVol < config.BB_VOL_THRESHOLD ? appState.bbKLowVol : appState.bbKHighVol;
       const regime = k <= 1.5 ? 'Low Vol (震盪市)' : 'High Vol (趨勢市)';
 
       // 3. SMA：用現有資料計算，不足時以當前價格替代

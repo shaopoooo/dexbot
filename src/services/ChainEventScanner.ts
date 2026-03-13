@@ -295,10 +295,9 @@ export async function findMintTimestampMs(
     // Now lo is exactly the block where the token first exists
     const mintBlock = lo;
     if (mintBlock > currentBlock) {
-         log.warn(`[MintSearch] #${tokenId} token exists binary search failed (lo > currentBlock)`);
-         return null;
+        log.warn(`[MintSearch] #${tokenId} token exists binary search failed (lo > currentBlock)`);
+        return null;
     }
-
 
     let block: ethers.Block | null;
     try {

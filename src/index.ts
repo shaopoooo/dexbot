@@ -44,6 +44,8 @@ function buildCronJob() {
         getPriceBufferSnapshot(), getOpenTimestampSnapshot(), botService.getSortBy(),
         PositionScanner.getDiscoveredSnapshot(), config.WALLET_ADDRESSES,
         bandwidthTracker.snapshot(), currentIntervalMinutes,
+        appState.bbKLowVol, appState.bbKHighVol,
+        PositionScanner.getClosedSnapshot(),
       );
       await triggerStateSave().catch((e) => log.error(`State save: ${e}`));
       log.section('cycle end');
@@ -215,6 +217,8 @@ async function runRiskManager() {
         pos.token0Symbol,
         pos.token1Symbol,
         gasCostUSD,
+        parseFloat(pos.bbMinPrice || '0'),
+        parseFloat(pos.bbMaxPrice || '0'),
       );
       pos.rebalance = rb ?? undefined;
     }
@@ -224,7 +228,7 @@ async function runRiskManager() {
     // Log snapshots here — after both BBEngine and RiskManager have enriched the positions,
     // so positions.log reflects correct Health Score, Drift %, and Breakeven values.
     const bbForLog = Object.values(appState.bbs)[0] ?? null;
-    PositionScanner.logSnapshots(appState.positions, bbForLog);
+    PositionScanner.logSnapshots(appState.positions, bbForLog, appState.bbKLowVol, appState.bbKHighVol);
   } catch (error) {
     log.error(`RiskManager: ${error}`);
   } finally { activeTasks--; }
@@ -266,7 +270,7 @@ async function runBotService() {
     if (entries.length === 0) return;
 
     await botService.sendConsolidatedReport(entries, appState.pools, appState.lastUpdated);
-    log.info(`✅ report sent  ${entries.length} position(s)`);
+    log.info(`✅ Telegram report sent  ${entries.length} position(s)`);
   } catch (error) {
     log.error(`BotService: ${error}`);
   }
@@ -277,6 +281,11 @@ async function main() {
   log.section('DexInfoBot startup');
 
   botService.setRescheduleCallback(reschedule);
+  botService.setBbkCallback((kLow, kHigh) => {
+    appState.bbKLowVol  = kLow;
+    appState.bbKHighVol = kHigh;
+    log.info(`📐 BB k values updated: low=${kLow}  high=${kHigh}`);
+  });
   botService.startBot().catch((e) => log.error(`Bot start error: ${e}`));
 
   const savedState = await loadState();
@@ -287,6 +296,9 @@ async function main() {
     bandwidthTracker.restore(savedState.bandwidthWindows ?? {});
     if (savedState.sortBy) botService.setSortBy(savedState.sortBy);
     if (savedState.intervalMinutes) currentIntervalMinutes = savedState.intervalMinutes;
+    if (savedState.bbKLowVol  !== undefined) appState.bbKLowVol  = savedState.bbKLowVol;
+    if (savedState.bbKHighVol !== undefined) appState.bbKHighVol = savedState.bbKHighVol;
+    PositionScanner.restoreClosedTokenIds(savedState.closedTokenIds ?? []);
     log.info('✅ state restored from previous session');
   }
 
@@ -322,10 +334,11 @@ async function main() {
     getPriceBufferSnapshot(), getOpenTimestampSnapshot(), botService.getSortBy(),
     PositionScanner.getDiscoveredSnapshot(), config.WALLET_ADDRESSES,
     bandwidthTracker.snapshot(), currentIntervalMinutes,
+    appState.bbKLowVol, appState.bbKHighVol,
   );
 
   await triggerStateSave();
-  await runBotService().catch((e) => log.error(`Startup report: ${e}`));
+  // await runBotService().catch((e) => log.error(`Startup report: ${e}`));
   log.info(`startup complete — scheduler enabled (interval: ${currentIntervalMinutes}m)`);
   log.section('ready');
 
@@ -346,6 +359,7 @@ async function gracefulShutdown(signal: string) {
       getPriceBufferSnapshot(), getOpenTimestampSnapshot(), botService.getSortBy(),
       PositionScanner.getDiscoveredSnapshot(), config.WALLET_ADDRESSES,
       bandwidthTracker.snapshot(), currentIntervalMinutes,
+      appState.bbKLowVol, appState.bbKHighVol,
     );
     log.info('✅ state saved — exiting');
   } catch (e) {
